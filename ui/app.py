@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import dataclasses
+import json
 import logging
 import math
 import queue
@@ -38,6 +39,7 @@ from config.settings import (
     OWS_TOKEN_NOTICE,
     PORTAL_LOGIN_URL,
     AppSettings,
+    ProfileSettings,
 )
 from core.bid_pipeline import BidPipeline, BidRequest, BidResult
 from core.license_guard import LicenseGuard, LicenseStatus
@@ -140,12 +142,53 @@ class ArmedBid:
 class Backend:
     """Вся «живая» логика приложения; вызывается из UI через Future."""
 
+    # -- автосохранение профиля ---------------------------------------------- #
+    @staticmethod
+    def _profile_file(settings: AppSettings) -> Path:
+        return Path(settings.data_dir) / "profile.json"
+
+    def _load_saved_profile(self, settings: AppSettings) -> AppSettings:
+        """Восстанавливает профиль поставщика из profile.json (не секрет)."""
+        path = self._profile_file(settings)
+        if not path.exists():
+            return settings
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            get_logger("backend").warning("Профиль не восстановлен: %s", exc)
+            return settings
+        fields = {
+            key: value
+            for key, value in data.items()
+            if key in ProfileSettings.__dataclass_fields__
+        }
+        if "doc_dir" in fields:
+            fields["doc_dir"] = Path(fields["doc_dir"])
+        if "export_dir" in fields:
+            fields["export_dir"] = Path(fields["export_dir"])
+        profile = dataclasses.replace(settings.profile, **fields)
+        return dataclasses.replace(settings, profile=profile)
+
+    def save_profile_to_disk(self, profile: Any) -> Path:
+        """Сохраняет профиль поставщика на диск (переживает перезапуск)."""
+        path = self._profile_file(self.settings)
+        payload = {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in dataclasses.asdict(profile).items()
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return path
+
     def __init__(
         self,
         settings: AppSettings,
         events: UiEventQueue,
         logger: logging.Logger | None = None,
     ) -> None:
+        settings = self._load_saved_profile(settings)
         self.settings = settings
         self.events = events
         self.log = logger or get_logger("backend")
@@ -239,6 +282,32 @@ class Backend:
         )
 
     # -- автопилот ----------------------------------------------------------- #
+    # Где брать документы для РЕАЛЬНОЙ подачи на портале (опыт подачи
+    # 73154497/73049065). Порядок — как в конкурсной документации.
+    DOC_SOURCES: tuple[tuple[str, str], ...] = (
+        ("Прил.1 (лоты и условия)", "формируется порталом из данных заявки"),
+        ("Прил.2 (соглашение об участии)", "портал генерирует из формы заявки"),
+        ("Прил.4 (бенефициары)", "заполняется формой в заявке — портал создаёт PDF"),
+        (
+            "Прил.11 (квалификация работ)",
+            "Рабочий кабинет → Реестр опытов работы (eDepository)",
+        ),
+        (
+            "Прил.15 (техспец, слот «Поставщика»)",
+            "ваша смета/ТЗ из папки docs\\ (кнопка «Автопилот» подхватит)",
+        ),
+        (
+            "Прил.19 (обеспечение заявки)",
+            "ЭБГ от банка (Bereke: Рабочий кабинет → Электронные банковские "
+            "гарантии) или деньги с электронного кошелька",
+        ),
+        (
+            "Сведения о налоговой задолженности",
+            "запрос ИС ЦУЛС в кабинете В ДЕНЬ подачи (действуют 24 ч)",
+        ),
+        ("НДС свидетельство", "Профиль участника → разрешительные документы"),
+    )
+
     def _autopilot_request(
         self,
         state: LotState,
@@ -329,6 +398,13 @@ class Backend:
         if missing:
             self.log.warning(
                 "Нет обязательных документов: %s", ", ".join(missing)
+            )
+        if not request.dry_run:
+            self.log.info(
+                "Источники документов для реальной подачи: %s",
+                "; ".join(
+                    f"{name} — {source}" for name, source in self.DOC_SOURCES
+                ),
             )
         return report
 
@@ -693,11 +769,77 @@ class FastBidApp(ctk.CTk):
         )
         self._log_console.pack(fill="both", expand=True, padx=8, pady=8)
         self._build_license(self.tabs.tab("Лицензия"))
+        self._wire_clipboard(self)
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(settings.ui.refresh_ms, self._tick)
         self.after(500, self._tick_snapshot)
         self.log.info("Интерфейс запущен (режим: %s)", settings.mode)
+
+    # -- буфер обмена: Ctrl+C/X/V/A на русской раскладке --------------------- #
+    def _wire_clipboard(self, widget: Any) -> None:
+        """CTkEntry на русской раскладке теряет Ctrl+V (keysym кириллический).
+
+        Вешаем явные обработчики на оба раскладочных варианта для всех
+        текстовых полей приложения.
+        """
+        for child in widget.winfo_children():
+            self._wire_clipboard(child)
+        inner = getattr(widget, "_entry", None)  # внутренний tkinter.Entry
+        if inner is None:
+            return
+
+        def paste(event: Any) -> str | None:
+            try:
+                text = inner.clipboard_get()
+            except Exception:
+                return "break"
+            try:
+                inner.delete("sel.first", "sel.last")
+            except Exception:
+                pass
+            inner.insert("insert", text)
+            return "break"
+
+        def copy_sel(event: Any) -> str | None:
+            try:
+                text = inner.get("sel.first", "sel.last")
+            except Exception:
+                return "break"
+            inner.clipboard_clear()
+            inner.clipboard_append(text)
+            return "break"
+
+        def cut(event: Any) -> str | None:
+            try:
+                text = inner.get("sel.first", "sel.last")
+            except Exception:
+                return "break"
+            inner.clipboard_clear()
+            inner.clipboard_append(text)
+            inner.delete("sel.first", "sel.last")
+            return "break"
+
+        def select_all(event: Any) -> str | None:
+            inner.select_range(0, "end")
+            inner.icursor("end")
+            return "break"
+
+        paste_keys = ("<Control-v>", "<Control-V>", "<Control-Cyrillic_em>")
+        copy_keys = ("<Control-c>", "<Control-C>", "<Control-Cyrillic_es>")
+        cut_keys = ("<Control-x>", "<Control-X>", "<Control-Cyrillic_che>")
+        all_keys = ("<Control-a>", "<Control-A>", "<Control-Cyrillic_ef>")
+        for keys, fn in (
+            (paste_keys, paste),
+            (copy_keys, copy_sel),
+            (cut_keys, cut),
+            (all_keys, select_all),
+        ):
+            for seq in keys:
+                try:
+                    inner.bind(seq, fn)
+                except Exception:  # pragma: no cover
+                    pass
 
     # -- вкладка «Панель» ---------------------------------------------------- #
     def _build_dashboard(self, tab: Any) -> None:
@@ -1327,8 +1469,11 @@ class FastBidApp(ctk.CTk):
             except Exception as exc:
                 messagebox.showwarning("Профиль", str(exc))
                 return
-            self.log.info("Профиль поставщика обновлён в памяти")
-            messagebox.showinfo("Профиль", "Сохранено для новых заявок в этой сессии.")
+            path = self.backend.save_profile_to_disk(self.settings.profile)
+            self.log.info("Профиль поставщика сохранён: %s", path)
+            messagebox.showinfo(
+                "Профиль", "Сохранено (переживает перезапуск приложения)."
+            )
 
         future.add_done_callback(lambda _future: self._callbacks.put(saved))
 
