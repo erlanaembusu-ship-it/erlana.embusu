@@ -119,3 +119,48 @@ def delete_profile(path: Path) -> None:
     path = Path(path)
     if path.exists():
         path.unlink()
+
+
+def save_secret(path: Path, value: str) -> Path:
+    """DPAPI-шифрует произвольную строку (токены, пароли)."""
+    protected = _dpapi_protect(value.encode("utf-8"))
+    if protected is None:
+        if sys.platform == "win32":
+            raise OSError("CryptProtectData не выполнен")
+        LOG.warning("DPAPI недоступен — значение хранится В ОТКРЫТОМ ВИДЕ")
+        protected = value.encode("utf-8")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(base64.b64encode(protected))
+    if sys.platform != "win32":
+        path.chmod(0o600)
+    return path
+
+
+def load_secret(path: Path) -> str:
+    """Читает DPAPI-шифрованную строку ("" — файла нет/повреждён)."""
+    path = Path(path)
+    if not path.exists():
+        return ""
+    try:
+        blob = base64.b64decode(path.read_bytes())
+    except Exception as exc:
+        LOG.error("Файл секрета повреждён: %s", exc)
+        return ""
+    plain = _dpapi_unprotect(blob)
+    if plain is None:
+        if sys.platform == "win32":
+            LOG.error("Не удалось расшифровать секрет (другой пользователь?)")
+            return ""
+        plain = blob
+    try:
+        return plain.decode("utf-8")
+    except UnicodeDecodeError:
+        LOG.error("Секрет: некорректная кодировка")
+        return ""
+
+
+def delete_secret(path: Path) -> None:
+    path = Path(path)
+    if path.exists():
+        path.unlink()

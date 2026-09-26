@@ -450,6 +450,8 @@ class EcpSettings:
     key_alias: str = _env("FASTBID_ECP_KEY_ALIAS", "")
     # DPAPI-шифрованный пароль (заполняется из GUI «Настройки»).
     password_file: Path = DATA_DIR / "ecp_secret.bin"
+    # DPAPI-шифрованный токен реестра OWS (заполняется из GUI «Применить»).
+    ows_token_file: Path = DATA_DIR / "ows_token.bin"
 
 
 @dataclass(frozen=True, slots=True)

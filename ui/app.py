@@ -264,6 +264,15 @@ class Backend:
     async def start_session(self) -> None:
         await self.session.start()
         self._apply_director_mode()
+        self._restore_ows_token()
+
+    def _restore_ows_token(self) -> None:
+        """Восстанавливает токен OWS из DPAPI-файла (переживает перезапуск)."""
+        token = ecp_store.load_secret(self.settings.ecp.ows_token_file)
+        if not token:
+            return
+        self._apply_settings(self.settings.with_(ows_token=token))
+        self.log.info("Токен OWS восстановлен из защищённого хранилища")
 
     def _apply_director_mode(self) -> None:
         """Режим директора: профиль ЭЦП из DPAPI → авто-ключ и пароль сессии."""
@@ -441,13 +450,18 @@ class Backend:
         return updated
 
     async def set_ows_token(self, raw: str) -> AppSettings:
-        """Токен реестра OWS v3 (только RAM). Пустая строка — сброс."""
+        """Токен реестра OWS v3. Пустая строка — сброс (и файла тоже)."""
         with self._armed_lock:
             if self.armed:
                 raise ValueError("Снимите активные заявки перед сменой токена OWS")
             token, _cookie = SessionManager.parse_credential(raw)
             updated = self._apply_settings(self.settings.with_(ows_token=token))
-        self.log.info("Токен OWS %s", "задан" if token else "сброшен")
+        if token:
+            ecp_store.save_secret(self.settings.ecp.ows_token_file, token)
+            self.log.info("Токен OWS сохранён в защищённое хранилище")
+        else:
+            ecp_store.delete_secret(self.settings.ecp.ows_token_file)
+            self.log.info("Токен OWS сброшен (файл удалён)")
         return updated
 
     async def unlock_and_login(self, password_value: str = "") -> dict[str, Any]:
