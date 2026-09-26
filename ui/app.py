@@ -150,9 +150,15 @@ class Backend:
         self.log = logger or get_logger("backend")
         self.ncalayer = NCALayerClient(settings.ncalayer)
         self.session = SessionManager(settings, self.ncalayer)
-        self.watcher = LotWatcher(self.session, settings)
-        self.pipeline = BidPipeline(self.session, self.ncalayer, self.watcher, settings)
         self.license = LicenseGuard(settings)
+        self.watcher = LotWatcher(self.session, settings)
+        self.pipeline = BidPipeline(
+            self.session,
+            self.ncalayer,
+            self.watcher,
+            settings,
+            license_guard=self.license,
+        )
         self.armed: dict[int, ArmedBid] = {}
         self._armed_lock = threading.RLock()
         self._active_tasks: set[asyncio.Task[Any]] = set()

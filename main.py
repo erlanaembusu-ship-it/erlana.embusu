@@ -92,6 +92,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--days", type=int, default=365, help="срок лицензии в днях")
     parser.add_argument("--to", default="license.json", help="куда записать лицензию")
     parser.add_argument("--target-hwid", default="", help="HWID машины лицензиата")
+    parser.add_argument(
+        "--max-amount",
+        type=float,
+        default=0.0,
+        help="тарифный лимит: максимальная сумма лота, ₸ (0 = без ограничения)",
+    )
     return parser
 
 
@@ -336,6 +342,7 @@ def run_utilities(settings: AppSettings, args: Any) -> int | None:
             normalized_hwid,
             args.days,
             private_pem,
+            max_lot_amount=float(args.max_amount or 0.0),
         )
         Path(args.to).write_text(
             json.dumps(document, ensure_ascii=False, indent=2),

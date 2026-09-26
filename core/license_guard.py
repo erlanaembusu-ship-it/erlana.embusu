@@ -169,6 +169,8 @@ class License:
     note: str = ""
     # Дополнительно: разрешённые ниши (пусто = все)
     blueprints: tuple[str, ...] = ()
+    # Тарифный лимит: максимальная сумма лота, ₸ (0 = без ограничения).
+    max_lot_amount: float = 0.0
 
     @property
     def expires_dt(self) -> datetime | None:
@@ -215,6 +217,12 @@ class LicenseStatus:
     hwid: str = ""
     bound_bin: str = ""
     checked_at: float = 0.0
+
+    @property
+    def max_lot_amount(self) -> float:
+        """Тарифный лимит суммы лота, ₸ (0 = без ограничения)."""
+        lic = self.license
+        return float(getattr(lic, "max_lot_amount", 0.0) or 0.0) if lic else 0.0
 
     @property
     def label_ru(self) -> str:
@@ -324,6 +332,11 @@ def verify_license(document: dict[str, Any], public_key_pem: str) -> License:
     blueprints = document.get("blueprints") or []
     if isinstance(blueprints, str):
         blueprints = [blueprints]
+    try:
+        raw_amount = document.get("max_lot_amount", document.get("maxLotAmount"))
+        max_lot_amount = max(0.0, float(raw_amount or 0.0))
+    except (TypeError, ValueError):
+        max_lot_amount = 0.0
     return License(
         licensee=str(document.get("licensee") or ""),
         bin_iin=str(document.get("bin_iin") or ""),
@@ -334,6 +347,7 @@ def verify_license(document: dict[str, Any], public_key_pem: str) -> License:
         seats=_as_int(document.get("seats"), 1),
         note=str(document.get("note") or ""),
         blueprints=tuple(str(item) for item in blueprints),
+        max_lot_amount=max_lot_amount,
     )
 
 
@@ -505,6 +519,7 @@ class LicenseGuard:
         blueprints: Iterable[str] = (),
         seats: int = 1,
         note: str = "",
+        max_lot_amount: float = 0.0,
     ) -> dict[str, Any]:
         """Формирует подписанную лицензию. Приватный ключ в поставку не входит."""
         now = datetime.now(timezone.utc)
@@ -518,6 +533,7 @@ class LicenseGuard:
             seats=seats,
             note=note,
             blueprints=tuple(blueprints),
+            max_lot_amount=max(0.0, float(max_lot_amount)),
         )
         return sign_license(license_obj, private_key_pem)
 
@@ -651,8 +667,15 @@ class LicenseGuard:
         return outcome
 
     # -- пробный период: дублирующее хранение -------------------------------- #
+    def _trial_backup_key(self) -> str:
+        """Имя значения резерва — привязано к пути trial-файла (изоляция тестов
+        и нестандартных конфигураций), у прод-пути ключ стабилен."""
+        digest = hashlib.md5(str(self.settings.trial_path).encode("utf-8")).hexdigest()
+        return f"TrialStart_{digest[:10]}"
+
     def _trial_backup_read(self) -> datetime | None:
         """Старт триала из резервного хранилища (реестр/домашний файл)."""
+        value_name = self._trial_backup_key()
         if sys.platform == "win32":
             try:
                 import winreg
@@ -660,11 +683,11 @@ class LicenseGuard:
                 with winreg.OpenKey(
                     winreg.HKEY_CURRENT_USER, r"Software\FastBidGosZakup"
                 ) as key:
-                    value, _ = winreg.QueryValueEx(key, "TrialStart")
+                    value, _ = winreg.QueryValueEx(key, value_name)
                 return datetime.fromisoformat(str(value))
             except Exception:
                 return None
-        path = Path.home() / ".fastbid_trial_start"
+        path = Path.home() / f".fastbid_{value_name}"
         if not path.exists():
             return None
         try:
@@ -673,6 +696,7 @@ class LicenseGuard:
             return None
 
     def _trial_backup_write(self, started: datetime) -> None:
+        value_name = self._trial_backup_key()
         if sys.platform == "win32":
             try:
                 import winreg
@@ -682,7 +706,7 @@ class LicenseGuard:
                 ) as key:
                     winreg.SetValueEx(
                         key,
-                        "TrialStart",
+                        value_name,
                         0,
                         winreg.REG_SZ,
                         started.isoformat(timespec="seconds"),
@@ -691,7 +715,7 @@ class LicenseGuard:
                 self.log.debug("Не удалось записать резерв триала: %s", exc)
             return
         try:
-            path = Path.home() / ".fastbid_trial_start"
+            path = Path.home() / f".fastbid_{value_name}"
             path.write_text(started.isoformat(timespec="seconds"), encoding="utf-8")
         except Exception as exc:  # pragma: no cover
             self.log.debug("Не удалось записать резерв триала: %s", exc)

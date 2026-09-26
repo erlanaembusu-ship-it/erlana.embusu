@@ -1075,3 +1075,70 @@ def test_corrupted_trial_is_invalid_and_not_reset(tmp_path) -> None:
     fresh = guard.check(force=True)
     assert fresh.valid is True and fresh.mode == "trial"
     assert fresh.trial_days_left >= 13
+
+
+def test_license_tariff_max_lot_amount_roundtrip(tmp_path) -> None:
+    """Тарифный лимит: выпуск → файл → проверка (roundtrip)."""
+    guard, private_pem, _public, _isolated = make_license_guard(tmp_path)
+    document = LicenseGuard.issue(
+        "ТОО Тариф",
+        TEST_BIN,
+        guard.hwid,
+        365,
+        private_pem,
+        max_lot_amount=10_000_000.0,
+    )
+    guard.install_license(_dump(tmp_path / "license.json", document))
+    status = guard.check(force=True)
+    assert status.valid
+    assert status.mode == "full"
+    assert status.max_lot_amount == 10_000_000.0
+
+    # Без лимита — 0 (без ограничения)
+    plain = LicenseGuard.issue("ТОО", TEST_BIN, guard.hwid, 30, private_pem)
+    guard.install_license(_dump(tmp_path / "license2.json", plain))
+    assert guard.check(force=True).max_lot_amount == 0.0
+
+
+def test_plan_blocks_lot_above_tariff_limit(tmp_path, settings, monkeypatch) -> None:
+    """Сумма лота выше тарифа → план недействителен, подача блокируется."""
+    guard, private_pem, _public, isolated = make_license_guard(tmp_path)
+    document = LicenseGuard.issue(
+        "ТОО Тариф",
+        TEST_BIN,
+        guard.hwid,
+        365,
+        private_pem,
+        max_lot_amount=5_000_000.0,
+    )
+    guard.install_license(_dump(isolated.license_path, document))
+    monkeypatch.setenv("FASTBID_LICENSE_ENFORCE", "0")
+
+    pipeline = BidPipeline(
+        _ExplodingSession(),
+        _NoSignNCA(),
+        LotWatcher(None, settings),
+        settings,
+        license_guard=guard,
+    )
+    # Сумма лота 47 344 048 ≫ лимит 5 000 000
+    plan = pipeline.plan(make_lot(amount=47_344_048.0), food_request(tmp_path))
+    assert not plan.is_valid
+    assert any("превышает лимит" in item for item in plan.errors)
+
+    # В пределах тарифа — план строится
+    plan_ok = pipeline.plan(make_lot(amount=4_500_000.0), food_request(tmp_path))
+    assert plan_ok.is_valid
+
+
+def test_plan_without_license_guard_has_no_tariff_check(tmp_path, settings) -> None:
+    """Без LicenseGuard (утилиты/тесты) тарифная проверка не выполняется."""
+    pipeline = BidPipeline(
+        _ExplodingSession(),
+        _NoSignNCA(),
+        LotWatcher(None, settings),
+        settings,
+    )
+    assert pipeline.license_guard is None
+    plan = pipeline.plan(make_lot(amount=999_999_999.0), food_request(tmp_path))
+    assert plan.is_valid

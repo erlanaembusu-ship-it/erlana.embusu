@@ -296,12 +296,15 @@ class BidPipeline:
         watcher: LotWatcher,
         settings: AppSettings,
         logger: logging.Logger | None = None,
+        license_guard: Any | None = None,
     ) -> None:
         self.session = session
         self.ncalayer = ncalayer
         self.watcher = watcher
         self.settings = settings
         self.log = logger or get_logger("pipeline")
+        # LicenseGuard — опционален (тесты/утилиты): нужен для тарифного лимита.
+        self.license_guard = license_guard
         self._upload_semaphore = asyncio.Semaphore(
             settings.pipeline.doc_upload_concurrency,
         )
@@ -658,6 +661,31 @@ class BidPipeline:
             warnings.append(f"Цена рассчитана автоматически: {price:,.2f} ₸")
 
         errors = blueprint.validate(values, lot.amount, price)
+
+        # -- предпусковая проверка требований участия ------------------------ #
+        # 1) Тарифный лимит: сумма лота не должна превышать подключённый тариф.
+        if self.license_guard is not None and lot.amount:
+            license_status = self.license_guard.check()
+            tariff_limit = license_status.max_lot_amount
+            if tariff_limit > 0 and float(lot.amount) > tariff_limit:
+                errors.append(
+                    f"Сумма лота {lot.amount:,.2f} ₸ превышает лимит "
+                    f"подключённого тарифа {tariff_limit:,.2f} ₸ — "
+                    "подача по этому лоту заблокирована"
+                )
+        # 2) Сводка обязательных требований к поставщику (в журнал, до взвода).
+        required_docs = [d.label for d in blueprint.required_documents]
+        self.log.info(
+            "Требования участия: обязательные документы — %s; требования "
+            "поставщика — %s; тарифный лимит — %s",
+            "; ".join(required_docs) or "нет в шаблоне ниши",
+            "; ".join(blueprint.notes_ru) or "нет особых",
+            (
+                f"{license_status.max_lot_amount:,.2f} ₸"
+                if self.license_guard is not None and license_status.max_lot_amount > 0
+                else "без ограничения"
+            ),
+        )
         comment = values.get("comment") or blueprint.build_comment(values)
         values["comment"] = comment
 
