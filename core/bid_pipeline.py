@@ -89,6 +89,10 @@ REJECTED_STATUSES = frozenset(
 )
 BID_ID_KEYS = ("bidId", "applicationId", "id", "number", "bidNumber")
 STATUS_KEYS = ("status", "state", "bidStatus", "applicationStatus")
+# Ответы submit, после которых повтор в бюджете допустим (тот же idem-ключ).
+# 425 — окно ещё закрыто (заявка точно не создана); остальные неоднозначны —
+# перед повтором обязателен verify по ключу.
+SUBMIT_RETRY_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
 
 
 def extract_bid_id(payload: Any) -> str:
@@ -1013,121 +1017,112 @@ class BidPipeline:
                 total_ms=stopwatch.total_ms,
             )
 
-        try:
-            response = await self.session.request(
-                "POST",
-                url,
-                json=body,
-                timeout=self.settings.timeouts.submit,
-                retry=False,
-                allow_relogin=False,
-                follow_redirects=False,
-            )
-        except PortalError as exc:
-            if exc.retryable and self.settings.retries.submit_verify_before_retry:
-                self.log.warning(
-                    "Submit упал по сети (%s) — сначала проверяю статус по ключу "
-                    "идемпотентности",
-                    exc,
-                )
-                verified = await self.verify(plan)
-                if verified.ok:
-                    verified.stages = stopwatch.report()
-                    verified.total_ms = stopwatch.total_ms
-                    return self._note_submitted(plan, verified, stopwatch)
-            self.stats["failed"] += 1
-            return BidResult(
-                ok=False,
-                lot_id=plan.lot.lot_id,
-                idem_key=plan.idem_key,
-                errors=[str(exc)],
-                stages=stopwatch.report(),
-                total_ms=stopwatch.total_ms,
-                t0_delta_ms=self._t0_delta_ms(plan),
-            )
-        stopwatch.mark("submit")
-
-        payload = self._safe_json(response)
-        if 200 <= response.status_code < 300:
-            problem = response_problem(payload)
-            if problem is None:
-                result = self._success_result(plan, payload, stopwatch)
-                return await self._post_submit_verify(plan, result)
-            # HTTP 2xx, но заявка НЕ подтверждена (HTML/пустой JSON/отказ).
-            self.log.error(
-                "Submit: HTTP %d, но подача НЕ подтверждена — %s",
-                response.status_code,
-                problem,
-            )
-            if self.settings.pipeline.verify_after_submit:
-                verified = await self.verify(plan)
-                if verified.ok:
-                    verified.stages = stopwatch.report()
-                    verified.total_ms = stopwatch.total_ms
-                    return self._note_submitted(plan, verified, stopwatch)
-            self.stats["failed"] += 1
-            return BidResult(
-                ok=False,
-                lot_id=plan.lot.lot_id,
-                idem_key=plan.idem_key,
-                errors=[f"Подача не подтверждена: {problem}"],
-                stages=stopwatch.report(),
-                total_ms=stopwatch.total_ms,
-                t0_delta_ms=self._t0_delta_ms(plan),
-                raw=payload,
-            )
-
-        # 409 — дубль (идемпотентность), 425 — окно ещё закрыто:
-        # в обоих случаях сначала выясняем, не принята ли заявка ранее.
-        if response.status_code in (408, 409, 425, 429, 500, 502, 503, 504):
-            self.log.warning(
-                "Submit вернул HTTP %d — проверяю, не принята ли заявка ранее",
-                response.status_code,
-            )
-            verified = await self.verify(plan)
-            if verified.ok:
-                verified.stages = stopwatch.report()
-                verified.total_ms = stopwatch.total_ms
-                return self._note_submitted(plan, verified, stopwatch)
-
-        # 425 — окно приёма ещё не открылось: submit уходит строго по часам
-        # сервера, а портал может открыть окно с миллисекундным джиттером.
-        # Повторяем безопасно в течение submit_425_window_s: тот же idem-ключ,
-        # перед каждым повтором — verify по ключу (двойной подачи не будет).
-        if response.status_code == 425:
-            deadline = time.monotonic() + self.settings.retries.submit_425_window_s
-            attempt_sleep = 0.1
-            while time.monotonic() < deadline:
-                await asyncio.sleep(attempt_sleep)
-                attempt_sleep = min(attempt_sleep * 2, 0.4)
-                verified = await self.verify(plan)
-                if verified.ok:
-                    verified.stages = stopwatch.report()
-                    verified.total_ms = stopwatch.total_ms
-                    return self._note_submitted(plan, verified, stopwatch)
-                response = await self.session.request(
+        retries = self.settings.retries
+        budget_s = retries.submit_budget_s
+        deadline = time.monotonic() + budget_s
+        pause = 0.1
+        attempt = 0
+        response: Any = None
+        payload: dict[str, Any] = {}
+        network_error = ""
+        # Последний исход неоднозначен (сеть/таймаут/5xx): заявка могла дойти.
+        ambiguous = False
+        while True:
+            attempt += 1
+            try:
+                response = await self._hot_request(
                     "POST",
                     url,
-                    json=body,
+                    deadline,
                     timeout=self.settings.timeouts.submit,
-                    retry=False,
-                    allow_relogin=False,
+                    json=body,
                     follow_redirects=False,
                 )
                 payload = self._safe_json(response)
-                if 200 <= response.status_code < 300:
-                    problem = response_problem(payload)
-                    if problem is None:
-                        result = self._success_result(plan, payload, stopwatch)
-                        return await self._post_submit_verify(plan, result)
-                    break  # 2xx без подтверждения — наружу как есть
-                if response.status_code != 425:
-                    break  # другой статус — наружу как есть
-                self.log.debug("Повтор submit: окно ещё не открыто (HTTP 425)")
+                network_error = ""
+            except PortalError as exc:
+                response, payload, network_error = None, {}, str(exc)
+                if not exc.retryable:
+                    break
+            if attempt == 1:
+                stopwatch.mark("submit")
+
+            status = response.status_code if response is not None else None
+            if status is not None and 200 <= status < 300:
+                problem = response_problem(payload)
+                if problem is None:
+                    result = self._success_result(plan, payload, stopwatch)
+                    return await self._post_submit_verify(plan, result)
+                # HTTP 2xx, но заявка НЕ подтверждена (HTML/пустой JSON/отказ).
+                self.log.error(
+                    "Submit: HTTP %d, но подача НЕ подтверждена — %s", status, problem
+                )
+                if self.settings.pipeline.verify_after_submit:
+                    verified = await self.verify(plan, deadline=self._grace(deadline))
+                    if verified.ok:
+                        return self._verified_success(plan, verified, stopwatch)
+                self.stats["failed"] += 1
+                return BidResult(
+                    ok=False,
+                    lot_id=plan.lot.lot_id,
+                    idem_key=plan.idem_key,
+                    errors=[f"Подача не подтверждена: {problem}"],
+                    stages=stopwatch.report(),
+                    total_ms=stopwatch.total_ms,
+                    t0_delta_ms=self._t0_delta_ms(plan),
+                    raw=payload,
+                )
+
+            if (
+                status is not None
+                and status != 409
+                and status not in SUBMIT_RETRY_STATUSES
+            ):
+                ambiguous = False
+                break  # окончательный отказ портала
+            ambiguous = status != 425
+            if status is None and not retries.submit_verify_before_retry:
+                break
+            if status is None:
+                self.log.warning(
+                    "Submit упал по сети (%s) — проверяю статус по ключу "
+                    "идемпотентности",
+                    network_error,
+                )
+            elif status != 425:
+                self.log.warning(
+                    "Submit вернул HTTP %d — проверяю, не принята ли заявка ранее",
+                    status,
+                )
+            # 425 — портал явно отказал (окно закрыто), заявка не создана:
+            # verify не нужен, повтор сразу. Остальное — сначала verify.
+            if status != 425:
+                verified = await self.verify(plan, deadline=deadline)
+                if verified.ok:
+                    return self._verified_success(plan, verified, stopwatch)
+            if status == 409:
+                break
+            if time.monotonic() + pause >= deadline:
+                break
+            await asyncio.sleep(pause)
+            pause = min(pause * 2, 0.4)
+            self.log.debug("Повтор submit #%d (HTTP %s)", attempt + 1, status or "—")
+
+        # Бюджет исчерпан на неоднозначном исходе: последний шанс узнать,
+        # не принята ли заявка, чтобы не сообщить ложный отказ.
+        if ambiguous and retries.submit_verify_before_retry:
+            verified = await self.verify(plan, deadline=self._grace(deadline))
+            if verified.ok:
+                return self._verified_success(plan, verified, stopwatch)
 
         self.stats["failed"] += 1
-        detail = payload.get("message", "") if isinstance(payload, dict) else ""
-        message = f"Подача отклонена: HTTP {response.status_code} {detail}".strip()
+        if response is None:
+            message = f"Подача не выполнена: {network_error}"
+        else:
+            detail = payload.get("message", "") if isinstance(payload, dict) else ""
+            message = f"Подача отклонена: HTTP {response.status_code} {detail}".strip()
+        if time.monotonic() >= deadline - 0.01 and attempt > 1:
+            message += f" (бюджет подачи {budget_s:.1f} с исчерпан, попыток: {attempt})"
         self.log.error(message)
         return BidResult(
             ok=False,
@@ -1139,6 +1134,41 @@ class BidPipeline:
             t0_delta_ms=self._t0_delta_ms(plan),
             raw=payload,
         )
+
+    def _grace(self, deadline: float) -> float:
+        """Дедлайн финальной проверки: не короче таймаута чтения от «сейчас»."""
+        return max(deadline, time.monotonic() + self.settings.timeouts.read)
+
+    async def _hot_request(
+        self, method: str, url: str, deadline: float, *, timeout: float, **kwargs: Any
+    ) -> Any:
+        """Одна попытка в «горячем» окне: без ретраев и relogin, не дольше бюджета."""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise PortalError("Бюджет подачи исчерпан", code="SUBMIT_BUDGET_EXCEEDED")
+        try:
+            async with asyncio.timeout(remaining):
+                return await self.session.request(
+                    method,
+                    url,
+                    timeout=min(timeout, remaining),
+                    retry=False,
+                    allow_relogin=False,
+                    **kwargs,
+                )
+        except TimeoutError as exc:
+            raise PortalError(
+                f"{method} {url}: нет ответа за {remaining:.1f} с",
+                code="SUBMIT_TIMEOUT",
+                retryable=True,
+            ) from exc
+
+    def _verified_success(
+        self, plan: BidPlan, verified: BidResult, stopwatch: Stopwatch
+    ) -> BidResult:
+        verified.stages = stopwatch.report()
+        verified.total_ms = stopwatch.total_ms
+        return self._note_submitted(plan, verified, stopwatch)
 
     async def _post_submit_verify(self, plan: BidPlan, result: BidResult) -> BidResult:
         """Подтверждает факт подачи по ключу идемпотентности (если включено).
@@ -1223,13 +1253,16 @@ class BidPipeline:
         return self._note_submitted(plan, result, stopwatch)
 
     # -- проверка факта подачи ---------------------------------------------- #
-    async def verify(self, plan: BidPlan) -> BidResult:
+    async def verify(
+        self, plan: BidPlan, *, deadline: float | None = None
+    ) -> BidResult:
         """Проверяет факт подачи по ключу идемпотентности.
 
         Успехом считается только ответ, в котором есть идентификатор заявки или
         подтверждающий статус: HTTP 2xx с HTML/пустым JSON/статусом отказа —
         это НЕ подтверждение. Метрику ``submitted`` здесь не трогаем (учёт идёт
         в ``_note_submitted``), иначе повторная проверка удвоила бы счётчик.
+        С ``deadline`` (горячее окно подачи) — одна попытка не дольше дедлайна.
         """
         endpoint = self.settings.endpoints
         url = endpoint.cabinet_url(
@@ -1238,11 +1271,16 @@ class BidPipeline:
             idem_key=plan.idem_key,
         )
         try:
-            response = await self.session.request(
-                "GET",
-                url,
-                timeout=self.settings.timeouts.read,
-            )
+            if deadline is None:
+                response = await self.session.request(
+                    "GET",
+                    url,
+                    timeout=self.settings.timeouts.read,
+                )
+            else:
+                response = await self._hot_request(
+                    "GET", url, deadline, timeout=self.settings.timeouts.read
+                )
         except PortalError as exc:
             return BidResult(
                 ok=False,

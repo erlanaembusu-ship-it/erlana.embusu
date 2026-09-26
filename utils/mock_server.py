@@ -193,21 +193,25 @@ def cms_verify_signature(der: bytes) -> tuple[bool, x509.Certificate | None, str
 
 
 def make_test_certificate(
-    bin_iin: str = TEST_BIN, cn: str = TEST_SUBJECT_CN, days: int = 365
+    bin_iin: str = TEST_BIN,
+    cn: str = TEST_SUBJECT_CN,
+    days: int = 365,
+    iin: str = "880101300123",
 ) -> tuple[rsa.RSAPrivateKey, x509.Certificate]:
     """Создаёт ключ и самоподписанный сертификат, похожий на ЭЦП РК.
 
-    В subject попадают ``serialNumber`` и OID ветки РК с 12-значным БИН/ИИН —
-    так же, как в сертификатах НУЦ РК. Благодаря этому парсер БИН в ядре
-    проверяется на реалистичных данных, а не на заглушке.
+    Subject как у сертификата ЮЛ от НУЦ РК: ``SERIALNUMBER=IIN<ИИН сотрудника>``
+    и ``OU=BIN<БИН организации>``. Парсер БИН в ядре обязан вернуть именно
+    ``bin_iin`` (БИН), а не ИИН сотрудника.
     """
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     subject = x509.Name(
         [
             x509.NameAttribute(NameOID.COMMON_NAME, cn),
-            x509.NameAttribute(NameOID.SERIAL_NUMBER, bin_iin),
+            x509.NameAttribute(NameOID.SERIAL_NUMBER, f"IIN{iin}"),
+            x509.NameAttribute(NameOID.COUNTRY_NAME, "KZ"),
             x509.NameAttribute(NameOID.ORGANIZATION_NAME, cn),
-            x509.NameAttribute(OID_KZ_BIN, f"1.2.398.3.3.4.1.1={bin_iin}"),
+            x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, f"BIN{bin_iin}"),
         ]
     )
     now = dt.datetime.now(dt.timezone.utc)
@@ -422,6 +426,8 @@ class MockLot:
     open_after_s: float = 12.0
     window_s: float = 3600.0
     auto_open: bool = True
+    # Не отдавать startDate (проверка работы по статусу при неизвестном T0).
+    hide_start_date: bool = False
     start_epoch: float = 0.0
 
     # -- расписание --------------------------------------------------------- #
@@ -463,7 +469,7 @@ class MockLot:
     def to_node(self) -> dict[str, Any]:
         """Узел ``Lots`` в терминах GraphQL v3."""
         self.refresh()
-        start = self._fmt(self.start_epoch)
+        start = "" if self.hide_start_date else self._fmt(self.start_epoch)
         end = self._fmt(self.start_epoch + self.window_s)
         return {
             "id": self.id,
@@ -553,6 +559,9 @@ class MockPortal:
         self.forced: dict[str, Any] = {
             "unauthorized_pings": 0,  # сколько следующих ping вернут 401
             "fail_next_submit": 0,  # сколько следующих submit вернут 500
+            # сколько следующих submit ПРИМУТ заявку, но вернут 500 (потерянный
+            # ответ: проверка verify-перед-повтором)
+            "accept_then_fail_submits": 0,
             "reject_all_submits": False,  # всегда отклонять подачу
             "idempotency_mode": "dedupe",  # dedupe | conflict
             "submit_delay_ms": 0.0,  # искусственная задержка submit
@@ -585,8 +594,15 @@ class MockPortal:
         self.running = False
         if self._server is not None:
             self._server.close()
+            for task in list(self._connections):
+                task.cancel()
+            # 3.12+: wait_closed ждёт все соединения — idle keep-alive клиента
+            # иначе держит остановку до таймаута.
+            close_clients = getattr(self._server, "close_clients", None)
+            if callable(close_clients):
+                close_clients()
             with contextlib.suppress(Exception):
-                await self._server.wait_closed()
+                await asyncio.wait_for(self._server.wait_closed(), timeout=5.0)
             self._server = None
         for task in list(self._connections):
             task.cancel()
@@ -604,6 +620,9 @@ class MockPortal:
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         conn = HttpConnection(reader, writer, self.log)
+        task = asyncio.current_task()
+        if task is not None:
+            self._connections.add(task)
         try:
             while not conn.closed:
                 request = await conn.read_request()
@@ -626,6 +645,8 @@ class MockPortal:
         except Exception as exc:
             self.log.debug("Соединение завершено: %s", exc)
         finally:
+            if task is not None:
+                self._connections.discard(task)
             conn.close()
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
@@ -829,8 +850,12 @@ class MockPortal:
     @staticmethod
     def _bin_from_certificate(certificate: x509.Certificate) -> str:
         subject = certificate.subject.rfc4514_string()
-        match = re.search(r"\b(\d{12})\b", subject)
-        return match.group(1) if match else ""
+        # Как у НУЦ: OU=BIN… (юрлицо) приоритетнее SERIALNUMBER=IIN… (сотрудник)
+        for pattern in (r"BIN(\d{12})\b", r"IIN(\d{12})\b", r"\b(\d{12})\b"):
+            match = re.search(pattern, subject)
+            if match:
+                return match.group(1)
+        return ""
 
     # -- сессия ------------------------------------------------------------- #
     async def _handle_ping(self, conn: HttpConnection, request: HttpRequest) -> None:
@@ -1045,6 +1070,13 @@ class MockPortal:
             lot_id,
             len(signed),
         )
+        if self.forced.get("accept_then_fail_submits", 0) > 0:
+            self.forced["accept_then_fail_submits"] -= 1
+            self._bump("submit_accepted_lost")
+            await conn.send_json(
+                500, {"error": "temporary", "message": "Ответ потерян"}
+            )
+            return
         await conn.send_json(200, dict(bid))
 
     # -- проверка факта подачи ---------------------------------------------- #
@@ -1096,6 +1128,7 @@ class MockPortal:
             for key in (
                 "unauthorized_pings",
                 "fail_next_submit",
+                "accept_then_fail_submits",
                 "idempotency_mode",
                 "submit_delay_ms",
                 "reject_all_submits",
@@ -1218,14 +1251,7 @@ class MockNCALayer:
         self.counters["connections"] += 1
         try:
             # Приветствие — как у настоящего NCALayer
-            await websocket.send(
-                json.dumps(
-                    {
-                        "version": "1.4.0-mock",
-                        "modules": ["kz.gov.pki.knca.basics", "kz.gov.pki.knca"],
-                    }
-                )
-            )
+            await websocket.send(json.dumps({"result": {"version": "1.4.0-mock"}}))
             async for raw in websocket:
                 snapshot = raw[:400] if isinstance(raw, str) else raw
                 self.sign_requests.append({"raw": snapshot})
@@ -1379,12 +1405,14 @@ class MockServers:
         nca_password: str = "NCAPassword123",
         nca_delay_ms: float = 0.0,
         require_password: bool = False,
+        latency_ms: float = 0.0,
         logger: logging.Logger | None = None,
     ) -> None:
         self.portal = MockPortal(
             host,
             http_port,
             lot or MockLot(open_after_s=open_after_s),
+            latency_ms=latency_ms,
             logger=logger,
         )
         self.ncalayer = MockNCALayer(

@@ -66,6 +66,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--verbose", "-v", action="store_true", help="подробный лог selftest"
     )
     parser.add_argument(
+        "--latency-ms",
+        type=float,
+        default=0.0,
+        help="искусственная задержка каждого ответа mock-портала (selftest)",
+    )
+    parser.add_argument(
         "--nca-password",
         default="NCAPassword123",
         help="пароль тестового контейнера ЭЦП (mock)",
@@ -172,7 +178,7 @@ def run_gui(settings: AppSettings, args: Any) -> int:
         )
         server_thread.start()
         if not server_thread.wait_until_ready():
-            log.error("Не удалось запустить заглушки")
+            log.error("Не удалось запустить заглушки: %s", server_thread.error)
             return 1
         settings = server_thread.servers.settings_for(settings)
         log.warning("MOCK-РЕЖИМ: %s", server_thread.servers.summary())
@@ -239,6 +245,7 @@ def run_selftest(settings: AppSettings, args: Any) -> int:
             args.ws_port,
             lot=MockLot(open_after_s=args.open_after),
             nca_password=args.nca_password,
+            latency_ms=args.latency_ms,
         )
         await servers.start()
         try:
@@ -274,19 +281,39 @@ def run_selftest(settings: AppSettings, args: Any) -> int:
                     },
                 )
                 result = await pipeline.run_cycle(request)
+            # Задержка приёма от T0 — по часам самого «портала», независимо от
+            # оценки часов клиента.
+            bid = servers.portal.bids.get(result.idem_key) if result.ok else None
+            t0_to_accept_ms = (
+                round((bid["submittedAt"] - servers.portal.lot.start_epoch) * 1000, 1)
+                if bid
+                else None
+            )
+            budget_ms = mock_settings.retries.submit_budget_s * 1000
             report = {
                 "ok": result.ok,
                 "bid_id": result.bid_id,
                 "stages": result.stages,
                 "total_ms": result.total_ms,
                 "t0_delta_ms": result.t0_delta_ms,
+                "t0_to_accept_ms": t0_to_accept_ms,
+                "submit_budget_ms": budget_ms,
                 "errors": result.errors,
                 "nca": dict(nca.stats),
                 "portal": dict(servers.portal.counters),
+                "clock": watcher.clock.describe(),
             }
             await session.close()
             await nca.close()
-            return result.ok, report
+            ok = result.ok
+            if ok and not result.dry_run:
+                ok = t0_to_accept_ms is not None and t0_to_accept_ms <= budget_ms
+                if not ok:
+                    report["errors"] = [
+                        *result.errors,
+                        f"заявка принята позже бюджета {budget_ms:.0f} мс от T0",
+                    ]
+            return ok, report
         finally:
             await servers.stop()
 
@@ -323,8 +350,16 @@ def run_utilities(settings: AppSettings, args: Any) -> int | None:
                 "--target-hwid <HWID> [--licensee ... --days N --to файл]"
             )
             return 2
-        from core.license_guard import LicenseGuard
+        from core.license_guard import LicenseGuard, normalize_bin_iin
 
+        try:
+            bin_iin = normalize_bin_iin(args.bin)
+        except ValueError as exc:
+            print(f"Ошибка: {exc}")
+            return 2
+        if args.days <= 0:
+            print(f"Ошибка: срок лицензии --days должен быть > 0, получено {args.days}")
+            return 2
         normalized_hwid = LicenseGuard.normalize_hwid(args.target_hwid)
         if len(normalized_hwid) != 32 or any(
             ch not in "0123456789ABCDEF" for ch in normalized_hwid
@@ -335,15 +370,25 @@ def run_utilities(settings: AppSettings, args: Any) -> int | None:
                 "допустим — нормализуем автоматически)."
             )
             return 2
-        private_pem = Path(args.private_key).read_text(encoding="utf-8")
-        document = LicenseGuard.issue(
-            args.licensee or "Лицензиат",
-            args.bin,
-            normalized_hwid,
-            args.days,
-            private_pem,
-            max_lot_amount=float(args.max_amount or 0.0),
-        )
+        try:
+            private_pem = Path(args.private_key).read_text(encoding="utf-8")
+        except (OSError, ValueError) as exc:
+            print(
+                f"Ошибка: не удалось прочитать приватный ключ {args.private_key}: {exc}"
+            )
+            return 2
+        try:
+            document = LicenseGuard.issue(
+                args.licensee or "Лицензиат",
+                bin_iin,
+                normalized_hwid,
+                args.days,
+                private_pem,
+                max_lot_amount=float(args.max_amount or 0.0),
+            )
+        except Exception as exc:  # битый/чужой PEM: ValueError, TypeError, ...
+            print(f"Ошибка: приватный ключ недействителен ({args.private_key}): {exc}")
+            return 2
         Path(args.to).write_text(
             json.dumps(document, ensure_ascii=False, indent=2),
             encoding="utf-8",

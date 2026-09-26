@@ -149,10 +149,25 @@ class PricingRule:
     def suggest(self, lot_amount: float | None) -> float | None:
         if self.strategy == "fixed":
             return round(self.fixed_amount, 2) or None
-        if self.strategy == "manual" or not lot_amount:
+        if (
+            self.strategy == "manual"
+            or not lot_amount
+            or not math.isfinite(lot_amount)
+            or lot_amount < 0
+        ):
             return None
         factor = min(max(self.factor, self.min_factor), self.max_factor)
-        return self._round(lot_amount * factor)
+        price = self._round(lot_amount * factor)
+        # Округление к ближайшему шагу могло вывести цену за границы лота —
+        # и она не прошла бы собственную validate().
+        step = self.step or 0.01
+        upper = lot_amount * self.max_factor
+        lower = lot_amount * self.min_factor
+        if price > upper:
+            price = round(math.floor(upper / step + 1e-9) * step, 2)
+        elif price < lower:
+            price = round(math.ceil(lower / step - 1e-9) * step, 2)
+        return price
 
     def _round(self, value: float) -> float:
         step = self.step or 0.01
@@ -359,13 +374,13 @@ FOOD_SUPPLY = NicheBlueprint(
     keywords=(
         "продукт",
         "питани",
-        "питан",
         "мяс",
         "молок",
         "хлеб",
         "овощ",
         "фрукт",
-        "круп",
+        "крупа",
+        "крупы",
         "мук",
         "сахар",
         "масл",
@@ -377,7 +392,7 @@ FOOD_SUPPLY = NicheBlueprint(
         "сок",
         "консерв",
         "соль",
-        "специ",
+        "специи",
         "макарон",
         "бакале",
     ),
@@ -451,13 +466,13 @@ CONSTRUCTION = NicheBlueprint(
     title_ru="Строительно-монтажные работы (СМР)",
     keywords=(
         "строитель",
-        " смр",
+        "смр",
         "ремонт",
         "реконструкц",
         "капитальн",
         "кровл",
         "фасад",
-        "отдел",
+        "отделочн",
         "монтаж",
         "канализ",
         "водопровод",
@@ -468,7 +483,7 @@ CONSTRUCTION = NicheBlueprint(
         "тротуар",
         "фундамент",
         "бетон",
-        "смет",
+        "сметн",
     ),
     fields=(
         PRICE_FIELD,
@@ -742,7 +757,6 @@ CLEANING_SERVICES = NicheBlueprint(
     keywords=(
         "клининг",
         "уборк",
-        "убор",
         "санитарн",
         "дезинсекц",
         "дератизац",
@@ -858,26 +872,37 @@ def get_blueprint(blueprint_id: str) -> NicheBlueprint:
 
 
 def score_blueprint(blueprint: NicheBlueprint, text: str) -> int:
-    """Сколько ключевых слов ниши нашлось в тексте (наименование+описание лота)."""
+    """Сколько ключевых слов ниши нашлось в тексте (наименование+описание лота).
+
+    Основа ищется только в НАЧАЛЕ слова: подстрока давала ложные ниши
+    («консоль» → «соль», «высоковольтный» → «сок»).
+    """
     haystack = text.lower()
-    return sum(1 for keyword in blueprint.keywords if keyword in haystack)
+    return sum(
+        1
+        for keyword in blueprint.keywords
+        if re.search(r"\b" + re.escape(keyword.strip()), haystack)
+    )
 
 
 def resolve_blueprint(text: str, min_score: int = 1) -> NicheBlueprint:
     """Подбирает нишевый шаблон по наименованию/описанию лота.
 
-    Ничья решается в пользу шаблона с большим числом совпадений, затем — в
-    порядке объявления (более специфичные ниши объявлены раньше generic).
+    Побеждает шаблон с наибольшим числом совпадений. Ничья между нишами —
+    универсальный шаблон: чужой набор обязательных документов хуже общего.
     """
     best: NicheBlueprint | None = None
     best_score = 0
+    tie = False
     for blueprint in BLUEPRINTS.values():
         if blueprint is GENERIC:
             continue
         score = score_blueprint(blueprint, text)
         if score > best_score:
-            best, best_score = blueprint, score
-    if best is None or best_score < min_score:
+            best, best_score, tie = blueprint, score, False
+        elif score and score == best_score:
+            tie = True
+    if best is None or best_score < min_score or tie:
         return GENERIC
     return best
 

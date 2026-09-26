@@ -83,10 +83,14 @@ class MSFormatter(logging.Formatter):
         local = datetime.fromtimestamp(record.created).astimezone()
         return f"{local:%H:%M:%S}"
 
+    def format(self, record: logging.LogRecord) -> str:
+        # Трейсбеки и прочий хвост записи фильтр сообщений не видит.
+        return redact_secrets(super().format(record))
+
 
 # Маскирование секретов в журнале: Bearer-токены не должны попадать в файлы
 # и UI-консоль даже при аварийном выводе ответов/исключений целиком.
-_BEARER_RE = re.compile(r"(Bearer\s+)[A-Za-z0-9._\-]{8,}", re.IGNORECASE)
+_BEARER_RE = re.compile(r"(Bearer\s+)[A-Za-z0-9._\-+/=]{8,}", re.IGNORECASE)
 
 
 def redact_secrets(text: str) -> str:
@@ -147,12 +151,18 @@ class UILogSink(logging.Handler):
         self.queue: queue.Queue[LogRecord] = queue.Queue(maxsize=maxsize)
 
     def emit(self, record: logging.LogRecord) -> None:
-        entry = LogRecord(
-            ts=datetime.fromtimestamp(record.created, tz=timezone.utc),
-            level=record.levelname,
-            component=record.name,
-            message=record.getMessage(),
-        )
+        # Ошибка форматирования не должна долетать до вызывающего кода
+        # (конвейера подачи).
+        try:
+            entry = LogRecord(
+                ts=datetime.fromtimestamp(record.created, tz=timezone.utc),
+                level=record.levelname,
+                component=record.name,
+                message=record.getMessage(),
+            )
+        except Exception:
+            self.handleError(record)
+            return
         try:
             self.queue.put_nowait(entry)
         except queue.Full:  # pragma: no cover - UI не успевает
@@ -184,7 +194,8 @@ def setup_logging(
     вызов перенастраивает обработчики, не плодя дубликаты.
     """
     if isinstance(level, str):
-        level = logging.getLevelName(level.upper())
+        # Опечатка в FASTBID_LOG_LEVEL не должна ронять запуск.
+        level = logging.getLevelNamesMapping().get(level.strip().upper(), logging.DEBUG)
     root = logging.getLogger()
     root.setLevel(level)
 
@@ -204,6 +215,8 @@ def setup_logging(
 
     sink = ui_sink or UILogSink()
     sink._fastbid = True  # type: ignore[attr-defined]
+    for old in [f for f in sink.filters if isinstance(f, SecretsFilter)]:
+        sink.removeFilter(old)
     sink.addFilter(secrets_filter)
     root.addHandler(sink)
 
@@ -224,6 +237,7 @@ def setup_logging(
         )
         file_handler._fastbid = True  # type: ignore[attr-defined]
         file_handler.setFormatter(formatter)
+        file_handler.addFilter(secrets_filter)
         root.addHandler(file_handler)
 
     # Библиотечные логгеры не должны забивать журнал на DEBUG-уровне

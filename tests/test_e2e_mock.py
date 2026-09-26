@@ -427,6 +427,9 @@ def test_license_issue_verify_and_tamper(tmp_path) -> None:
         trial_path=tmp_path / "trial.json",
     )
     guard = LicenseGuard(base.with_(license=isolated))
+    backup: dict[str, str] = {}  # резерв триала в памяти, не в реальном $HOME
+    guard._backup_get = lambda name: backup.get(name, "")  # type: ignore[method-assign]
+    guard._backup_set = backup.__setitem__  # type: ignore[method-assign]
     assert guard.check().mode == "trial"
     document = LicenseGuard.issue(
         "TOO Test", TEST_BIN, guard.hwid, 365, private_pem, features=["bid"]
