@@ -698,6 +698,9 @@ def test_watch_timeout_stops_cycle_without_submit(settings, tmp_path) -> None:
     async def scenario() -> dict:
         servers = MockServers(open_after_s=3600.0, nca_password=PASSWORD)
         await servers.start()
+        # T0 неизвестен (портал не отдал startDate) и окно не открывается:
+        # при известном T0 лимит наблюдения продлевается до T0.
+        servers.portal.lot.hide_start_date = True
         try:
             mock_settings = servers.settings_for(settings)
             mock_settings = mock_settings.with_(
@@ -884,6 +887,11 @@ def make_license_guard(
         trial_days=trial_days,
     )
     guard = LicenseGuard(base.with_(license=isolated))
+    # Резерв триала (реестр / домашний файл) — в памяти: тесты не должны
+    # трогать реальные хранилища машины разработчика.
+    backup: dict[str, str] = {}
+    guard._backup_get = lambda name: backup.get(name, "")  # type: ignore[method-assign]
+    guard._backup_set = backup.__setitem__  # type: ignore[method-assign]
     return guard, private_pem, public_pem, isolated
 
 
@@ -923,7 +931,20 @@ def test_license_days_left_not_clamped() -> None:
 def test_license_grace_uses_absolute_date(tmp_path) -> None:
     guard, private_pem, _public, isolated = make_license_guard(tmp_path, grace=7)
 
-    in_grace = LicenseGuard.issue("TOO", TEST_BIN, guard.hwid, -3, private_pem)
+    def expired_days_ago(days: int) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        return sign_license(
+            LicenseDoc(
+                licensee="TOO",
+                bin_iin=TEST_BIN,
+                hwid=guard.hwid,
+                issued_at=(now - timedelta(days=days + 365)).isoformat(),
+                expires_at=(now - timedelta(days=days)).isoformat(),
+            ),
+            private_pem,
+        )
+
+    in_grace = expired_days_ago(3)
     _dump(isolated.license_path, in_grace)
     status = guard.check(force=True)
     assert status.valid is True
@@ -931,7 +952,7 @@ def test_license_grace_uses_absolute_date(tmp_path) -> None:
     assert "грейс" in status.reason
     assert status.days_left < 0
 
-    beyond_grace = LicenseGuard.issue("TOO", TEST_BIN, guard.hwid, -30, private_pem)
+    beyond_grace = expired_days_ago(30)
     _dump(isolated.license_path, beyond_grace)
     expired = guard.check(force=True)
     assert expired.valid is False

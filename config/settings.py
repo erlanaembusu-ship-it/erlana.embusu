@@ -166,10 +166,11 @@ class RetryPolicy:
     retry_statuses: tuple[int, ...] = (408, 425, 429, 500, 502, 503, 504)
     relogin_attempts: int = 2
     relogin_delay: float = 1.5
-    # Submit уходит строго по часам сервера (T0), но окно у портала может
-    # открыться с миллисекундным джиттером → первый POST ловит 425. Повторяем
-    # безопасно: тот же idem-ключ, перед каждым повтором — verify по ключу.
-    submit_425_window_s: float = 2.0
+    # Жёсткий бюджет «горячей» части после T0: все POST submit, повторы на
+    # 425/сбоях и verify перед повтором укладываются в N секунд от первого
+    # POST. Каждый запрос в окне — одна попытка без relogin, таймаут
+    # подрезается до остатка бюджета. Повторы — с тем же idem-ключом.
+    submit_budget_s: float = 5.0
     # Перед повторным submit обязательно спрашиваем статус по idempotency-key:
     # двойная подача заявки недопустима.
     submit_verify_before_retry: bool = True
@@ -227,6 +228,11 @@ class WatcherSettings:
     post_open_interval: float = 0.30  # подтверждение открытия после T0
     min_interval_hard: float = 0.15  # ниже не опускаемся никогда
     clock_sync_samples: int = 3
+    # Фоновое уточнение часов зондами на смене секунды (refine_clock):
+    # запускается, если до T0 больше clock_refine_min_lead_s.
+    clock_refine_probes: int = 6
+    clock_target_ms: float = 25.0
+    clock_refine_min_lead_s: float = 2.0
     conditional_requests: bool = True  # If-None-Match / If-Modified-Since
     max_watch_seconds: float = 6 * 3600
     # Портал публикует даты в казахстанском времени (UTC+5, без перехода на
@@ -321,15 +327,19 @@ class NCALayerSettings:
 
     @property
     def basics_url(self) -> str:
-        return f"{self.scheme}://{self.host}:{self.port}{self.basics_path}"
+        return f"{self.root_url}{self.basics_path}"
 
     @property
     def legacy_url(self) -> str:
-        return f"{self.scheme}://{self.host}:{self.port}{self.legacy_path}"
+        return f"{self.root_url}{self.legacy_path}"
 
     @property
     def root_url(self) -> str:
-        return f"{self.scheme}://{self.host}:{self.port}"
+        # IPv6-адрес (::1) в URL обязан быть в квадратных скобках.
+        host = self.host
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        return f"{self.scheme}://{host}:{self.port}"
 
 
 # --------------------------------------------------------------------------- #

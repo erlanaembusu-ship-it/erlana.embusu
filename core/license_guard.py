@@ -54,6 +54,7 @@ __all__ = [
     "generate_keypair",
     "get_hwid",
     "machine_facts",
+    "normalize_bin_iin",
     "normalize_hwid",
     "sign_license",
     "verify_license",
@@ -62,9 +63,49 @@ __all__ = [
 HWID_SALT = "FastBidGosZakup/1.0/hwid"
 LOG = get_logger("license")
 
+# Допуски на неточность часов: старт триала «в будущем» и перевод часов назад.
+TRIAL_FUTURE_TOLERANCE = timedelta(minutes=5)
+CLOCK_ROLLBACK_TOLERANCE = timedelta(hours=1)
+_BACKUP_REG_KEY = r"Software\FastBidGosZakup"
+
 
 class LicenseError(RuntimeError):
     """Ошибка лицензии (подпись, привязка, срок)."""
+
+
+def _parse_utc(value: Any) -> datetime | None:
+    """ISO-дата → aware UTC (без смещения считается UTC); мусор → None."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
+    """Запись через временный файл + os.replace: сбой не портит trial.json."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.tmp")
+    temp_path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    os.replace(temp_path, path)
+
+
+def normalize_bin_iin(value: str) -> str:
+    """Строгий БИН/ИИН для выпуска лицензии: ровно 12 цифр.
+
+    Пробелы и дефисы допускаются. Пустой БИН недопустим: такая лицензия
+    подошла бы любому лицензиату.
+    """
+    cleaned = re.sub(r"[\s-]", "", str(value or ""))
+    if not re.fullmatch(r"[0-9]{12}", cleaned):
+        raise ValueError(f"БИН/ИИН должен состоять ровно из 12 цифр: {value!r}")
+    return cleaned
 
 
 # --------------------------------------------------------------------------- #
@@ -445,10 +486,9 @@ class LicenseGuard:
                 f"Лицензия оформлена на БИН/ИИН {status.bound_bin}, "
                 f"а вход выполнен под {cleaned}"
             )
-        if status.mode == "trial":
-            return None  # в триале привязка к БИН не требуется
         if not status.valid:
             return status.reason or "Лицензия недействительна"
+        # В действующем триале привязка к БИН не требуется
         return None
 
     def install_license(self, source: Path) -> LicenseStatus:
@@ -474,6 +514,9 @@ class LicenseGuard:
         if not isinstance(document, dict):
             return self._rejected_install("Файл лицензии должен быть JSON-объектом")
 
+        rollback = self._check_clock()
+        if rollback:
+            return self._rejected_install(rollback)
         candidate = self._evaluate_document(document, self._known_bin())
         if not candidate.valid:
             return self._rejected_install(
@@ -521,11 +564,20 @@ class LicenseGuard:
         note: str = "",
         max_lot_amount: float = 0.0,
     ) -> dict[str, Any]:
-        """Формирует подписанную лицензию. Приватный ключ в поставку не входит."""
+        """Формирует подписанную лицензию. Приватный ключ в поставку не входит.
+
+        БИН/ИИН обязателен (ровно 12 цифр), срок — целое число дней > 0,
+        иначе ``ValueError``.
+        """
+        if isinstance(days, bool) or not isinstance(days, int):
+            raise ValueError(f"Срок лицензии должен быть целым числом дней: {days!r}")
+        if days <= 0:
+            raise ValueError(f"Срок лицензии должен быть больше нуля: {days}")
+        cleaned_bin = normalize_bin_iin(bin_iin)
         now = datetime.now(timezone.utc)
         license_obj = License(
             licensee=licensee,
-            bin_iin="".join(ch for ch in bin_iin if ch.isdigit()),
+            bin_iin=cleaned_bin,
             hwid=normalize_hwid(hwid),
             issued_at=now.isoformat(timespec="seconds"),
             expires_at=(now + timedelta(days=days)).isoformat(timespec="seconds"),
@@ -548,6 +600,9 @@ class LicenseGuard:
             checked_at=time.time(),
             bound_bin=self._clean_bin(bin_iin),
         )
+        rollback = self._check_clock()
+        if rollback:
+            return replace(base, mode="invalid", reason=rollback)
         if not path.exists():
             return self._trial_status(bin_iin)
 
@@ -644,6 +699,13 @@ class LicenseGuard:
                 mode="invalid",
                 reason="Лицензия привязана к другому компьютеру (HWID не совпал)",
             )
+        if self.settings.require_bin_match and not bound_bin:
+            return replace(
+                outcome,
+                valid=False,
+                mode="invalid",
+                reason="В лицензии не указан БИН/ИИН — обратитесь к вендору",
+            )
         provided = self._clean_bin(bin_iin)
         if (
             self.settings.require_bin_match
@@ -667,58 +729,94 @@ class LicenseGuard:
         return outcome
 
     # -- пробный период: дублирующее хранение -------------------------------- #
-    def _trial_backup_key(self) -> str:
-        """Имя значения резерва — привязано к пути trial-файла (изоляция тестов
-        и нестандартных конфигураций), у прод-пути ключ стабилен."""
+    def _backup_value_name(self, name: str) -> str:
+        """Физическое имя значения резерва — с привязкой к пути trial-файла
+        (изоляция тестов и нестандартных конфигураций); у прод-пути стабильно."""
         digest = hashlib.md5(str(self.settings.trial_path).encode("utf-8")).hexdigest()
-        return f"TrialStart_{digest[:10]}"
+        return f"{name}_{digest[:10]}"
+
+    def _backup_get(self, name: str) -> str:
+        """Значение из резерва: реестр HKCU (Windows) или файл в домашней папке."""
+        value_name = self._backup_value_name(name)
+        try:
+            if sys.platform == "win32":
+                import winreg
+
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _BACKUP_REG_KEY) as key:
+                    value, _ = winreg.QueryValueEx(key, value_name)
+                return str(value).strip()
+            path = Path.home() / f".fastbid_{value_name}"
+            return path.read_text(encoding="utf-8").strip()
+        except Exception:
+            return ""
+
+    def _backup_set(self, name: str, value: str) -> None:
+        value_name = self._backup_value_name(name)
+        try:
+            if sys.platform == "win32":
+                import winreg
+
+                with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _BACKUP_REG_KEY) as key:
+                    winreg.SetValueEx(key, value_name, 0, winreg.REG_SZ, value)
+                return
+            path = Path.home() / f".fastbid_{value_name}"
+            path.write_text(value, encoding="utf-8")
+        except Exception as exc:  # pragma: no cover
+            self.log.debug("Не удалось записать резерв %s: %s", name, exc)
 
     def _trial_backup_read(self) -> datetime | None:
         """Старт триала из резервного хранилища (реестр/домашний файл)."""
-        value_name = self._trial_backup_key()
-        if sys.platform == "win32":
-            try:
-                import winreg
-
-                with winreg.OpenKey(
-                    winreg.HKEY_CURRENT_USER, r"Software\FastBidGosZakup"
-                ) as key:
-                    value, _ = winreg.QueryValueEx(key, value_name)
-                return datetime.fromisoformat(str(value))
-            except Exception:
-                return None
-        path = Path.home() / f".fastbid_{value_name}"
-        if not path.exists():
-            return None
-        try:
-            return datetime.fromisoformat(path.read_text(encoding="utf-8").strip())
-        except Exception:
-            return None
+        return _parse_utc(self._backup_get("TrialStart"))
 
     def _trial_backup_write(self, started: datetime) -> None:
-        value_name = self._trial_backup_key()
-        if sys.platform == "win32":
-            try:
-                import winreg
+        self._backup_set("TrialStart", started.isoformat(timespec="seconds"))
 
-                with winreg.CreateKey(
-                    winreg.HKEY_CURRENT_USER, r"Software\FastBidGosZakup"
-                ) as key:
-                    winreg.SetValueEx(
-                        key,
-                        value_name,
-                        0,
-                        winreg.REG_SZ,
-                        started.isoformat(timespec="seconds"),
-                    )
-            except Exception as exc:  # pragma: no cover
-                self.log.debug("Не удалось записать резерв триала: %s", exc)
-            return
+    def _own_trial_data(self, trial_path: Path) -> dict[str, Any] | None:
+        """trial.json этой машины; повреждённый или чужой файл → None."""
         try:
-            path = Path.home() / f".fastbid_{value_name}"
-            path.write_text(started.isoformat(timespec="seconds"), encoding="utf-8")
-        except Exception as exc:  # pragma: no cover
-            self.log.debug("Не удалось записать резерв триала: %s", exc)
+            data = json.loads(trial_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        if str(data.get("hwid") or "").upper() != self.hwid.upper():
+            return None
+        return data
+
+    def _check_clock(self) -> str:
+        """Защита от перевода часов назад (продление триала и лицензии).
+
+        Последнее виденное время (``last_seen``) хранится там же, где старт
+        триала: в trial.json и в резерве; берётся максимум. Если текущее время
+        отстаёт от него больше чем на час — возвращается причина отказа,
+        иначе метка обновляется и возвращается пустая строка.
+        """
+        now = datetime.now(timezone.utc)
+        trial_path = Path(self.settings.trial_path)
+        trial_data = self._own_trial_data(trial_path)
+        stored = [
+            value
+            for value in (
+                _parse_utc(trial_data.get("last_seen")) if trial_data else None,
+                _parse_utc(self._backup_get("LastSeen")),
+            )
+            if value is not None
+        ]
+        last_seen = max(stored, default=None)
+        if last_seen is not None and now + CLOCK_ROLLBACK_TOLERANCE < last_seen:
+            return (
+                "Системное время переведено назад: последний запуск был "
+                f"{last_seen:%d.%m.%Y %H:%M} UTC. Установите верные дату и время"
+            )
+        stamp = max(now, last_seen) if last_seen is not None else now
+        stamp_iso = stamp.isoformat(timespec="seconds")
+        self._backup_set("LastSeen", stamp_iso)
+        if trial_data is not None:
+            try:
+                _write_json_atomic(trial_path, {**trial_data, "last_seen": stamp_iso})
+            except Exception as exc:  # pragma: no cover
+                self.log.debug("Не удалось обновить last_seen: %s", exc)
+        return ""
 
     def _trial_status(self, bin_iin: str) -> LicenseStatus:
         """Статус пробного периода.
@@ -728,10 +826,12 @@ class LicenseGuard:
         бесконечно перезапускать, испортив файл). Старт триала дублируется в
         реестре (Windows) или домашнем файле (posix): удаление/подделка одного
         из источников триал не сбрасывает и не продлевает — при расхождении
-        берётся более ПОЗДНЯЯ дата.
+        берётся более РАННЯЯ дата и записывается в оба хранилища. Старт позже
+        «сейчас + 5 мин» — подделка: триал недействителен.
         """
         trial_path = Path(self.settings.trial_path)
         started_file: datetime | None = None
+        data: dict[str, Any] = {}
         if trial_path.exists():
             try:
                 raw = trial_path.read_text(encoding="utf-8")
@@ -760,41 +860,25 @@ class LicenseGuard:
                 return self._invalid_trial(
                     "Файл пробного периода повреждён: отсутствует дата начала",
                 )
-            try:
-                started_file = datetime.fromisoformat(
-                    started_iso.replace("Z", "+00:00"),
-                )
-            except ValueError:
+            started_file = _parse_utc(started_iso)
+            if started_file is None:
                 return self._invalid_trial(
                     "Файл пробного периода повреждён: неверная дата начала",
                 )
-            if started_file.tzinfo is None:
-                started_file = started_file.replace(tzinfo=timezone.utc)
 
         backup_start = self._trial_backup_read()
+        now = datetime.now(timezone.utc)
         if started_file is None and backup_start is None:
-            started = datetime.now(timezone.utc)
-            data = {
-                "hwid": self.hwid,
-                "started_at": started.isoformat(timespec="seconds"),
-                "bin_iin": self._clean_bin(bin_iin),
-            }
-            try:
-                trial_path.parent.mkdir(parents=True, exist_ok=True)
-                trial_path.write_text(
-                    json.dumps(data, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-                self.log.info("Пробный период начат: %s", data["started_at"])
-            except Exception as exc:  # pragma: no cover
-                self.log.error("Не удалось сохранить состояние триала: %s", exc)
-            self._trial_backup_write(started)
+            started = now
+            self.log.info(
+                "Пробный период начат: %s", started.isoformat(timespec="seconds")
+            )
         else:
-            # Файл и резерв дополняют друг друга: расхождение трактуется как
-            # подделка, берётся более ПОЗДНЯЯ дата (сдвиг «в прошлое» триал
-            # не продлевает). Отсутствующий источник восстанавливается.
+            # Файл и резерв дополняют друг друга: расхождение — подделка.
+            # Ранняя дата = меньше остатка, поэтому сдвиг одного источника
+            # «в будущее» триал не продлевает.
             candidates = [d for d in (started_file, backup_start) if d is not None]
-            started = max(candidates)
+            started = min(candidates)
             if (
                 started_file is not None
                 and backup_start is not None
@@ -802,27 +886,34 @@ class LicenseGuard:
             ):
                 self.log.warning(
                     "Расхождение даты старта триала (файл %s / резерв %s) — "
-                    "взята поздняя",
+                    "взята ранняя",
                     started_file.isoformat(timespec="seconds"),
                     backup_start.isoformat(timespec="seconds"),
                 )
-            if started_file is None:
-                data = {
-                    "hwid": self.hwid,
-                    "started_at": started.isoformat(timespec="seconds"),
-                    "bin_iin": self._clean_bin(bin_iin),
-                }
-                try:
-                    trial_path.parent.mkdir(parents=True, exist_ok=True)
-                    trial_path.write_text(
-                        json.dumps(data, ensure_ascii=False, indent=2),
-                        encoding="utf-8",
-                    )
-                except Exception as exc:  # pragma: no cover
-                    self.log.error("Не удалось восстановить триал: %s", exc)
+            if started > now + TRIAL_FUTURE_TOLERANCE:
+                return self._invalid_trial(
+                    "Дата начала пробного периода в будущем — данные триала "
+                    "подделаны или неверно установлено системное время",
+                )
+
+        # Отсутствующий или расходящийся источник получает раннюю дату
+        if started_file != started:
+            record = {
+                "hwid": self.hwid,
+                "bin_iin": self._clean_bin(bin_iin),
+                "last_seen": now.isoformat(timespec="seconds"),
+                **data,
+                "started_at": started.isoformat(timespec="seconds"),
+            }
+            try:
+                _write_json_atomic(trial_path, record)
+            except Exception as exc:  # pragma: no cover
+                self.log.error("Не удалось сохранить состояние триала: %s", exc)
+        if backup_start != started:
             self._trial_backup_write(started)
 
-        used_days = (datetime.now(timezone.utc) - started).total_seconds() / 86400.0
+        # max(0): старт в пределах допуска «в будущем» не добавляет дней
+        used_days = max(0.0, (now - started).total_seconds() / 86400.0)
         # ceil: день старта — полный день триала (иначе триал фактически 13 дн.)
         left = max(0, math.ceil(self.settings.trial_days - used_days))
         return LicenseStatus(

@@ -11,6 +11,12 @@
 
     set FASTBID_CONSOLE=1
     pyinstaller fastbid.spec --noconfirm
+
+Сборка для продажи (блокировка работы без действующей лицензии вшивается в
+exe runtime-хуком и не отключается переменной окружения у клиента)::
+
+    set FASTBID_LICENSE_ENFORCE=1
+    pyinstaller fastbid.spec --noconfirm
 """
 
 import os
@@ -18,6 +24,17 @@ import os
 from PyInstaller.utils.hooks import collect_all
 
 console = os.environ.get("FASTBID_CONSOLE", "0") == "1"
+
+runtime_hooks = []
+if os.environ.get("FASTBID_LICENSE_ENFORCE", "0") == "1":
+    # Настройки читают env при запуске, поэтому хук выставляет переменную до
+    # импорта кода приложения. Файл генерируется в workpath (глобал спеки
+    # PyInstaller, каталог сборки вне git).
+    os.makedirs(workpath, exist_ok=True)
+    enforce_hook = os.path.join(workpath, "rthook_license_enforce.py")
+    with open(enforce_hook, "w", encoding="utf-8") as hook_file:
+        hook_file.write('import os\nos.environ["FASTBID_LICENSE_ENFORCE"] = "1"\n')
+    runtime_hooks.append(enforce_hook)
 
 datas = []
 binaries = []
@@ -52,7 +69,7 @@ a = Analysis(
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
-    runtime_hooks=[],
+    runtime_hooks=runtime_hooks,
     excludes=["tkinter.test", "unittest", "pydoc_data"],
     noarchive=False,
 )

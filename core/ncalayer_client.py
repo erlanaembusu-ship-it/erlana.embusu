@@ -28,14 +28,17 @@ import contextlib
 import hashlib
 import json
 import logging
+import re
 import time
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field, replace
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Self
 
 import websockets
 from websockets.asyncio.client import ClientConnection
+from websockets.exceptions import ConnectionClosed
+from websockets.protocol import State
 
 from config.niche_blueprints import SignMode
 from config.settings import LOOPBACK_HOSTS, NCALayerSettings
@@ -105,14 +108,26 @@ class KeyInfo:
                 payload = {**data, **nested}
                 break
 
-        info = cls(
+        subject = pick(
+            "subject", "subjectDN", "subjectDn", "distinguishedName", "owner"
+        )
+        bin_iin = ""
+        for name in ("binIin", "bin_iin", "binIIN", "bin", "iin", "iIN"):
+            bin_iin = _normalize_bin_iin(payload.get(name))
+            if bin_iin:
+                break
+        if not bin_iin:
+            bin_iin = _bin_iin_from_dn(subject)
+        if not bin_iin:
+            # serialNumber у NCALayer — обычно серийный номер сертификата
+            # (hex), а не БИН: берём только явный IIN…/BIN… или ровно 12 цифр.
+            bin_iin = _pick_bin_iin(
+                [("SERIALNUMBER", str(payload.get("serialNumber") or ""))]
+            )
+        return cls(
             available=True,
-            bin_iin=pick(
-                "binIin", "bin_iin", "iin", "bin", "binIIN", "iIN", "serialNumber"
-            ),
-            subject=pick(
-                "subject", "subjectDN", "subjectDn", "distinguishedName", "owner"
-            ),
+            bin_iin=bin_iin,
+            subject=subject,
             issuer=pick("issuer", "issuerDN", "issuerDn", "ca"),
             serial=pick("serialNumber", "serial", "sn"),
             not_before=pick("notBefore", "validFrom", "valid_from"),
@@ -120,12 +135,6 @@ class KeyInfo:
             algorithm=pick("algorithm", "keyAlgorithm", "keyType"),
             raw=payload,
         )
-        if info.bin_iin and not info.bin_iin.isdigit():
-            # Иногда NCALayer возвращает строку со вставками — чистим до цифр
-            digits = "".join(ch for ch in info.bin_iin if ch.isdigit())
-            if len(digits) >= 12:
-                info = replace(info, bin_iin=digits[:12])
-        return info
 
     @classmethod
     def from_certificate(cls, cert: Any) -> KeyInfo:
@@ -276,34 +285,85 @@ def sha256_hex(raw: bytes) -> str:
 # --------------------------------------------------------------------------- #
 # Разбор сертификата ЭЦП
 # --------------------------------------------------------------------------- #
-# 12 цифр БИН/ИИН; допускаем префикс IIN/BIN, приклеенный к номеру
-# (настоящие сертификаты НУЦ: SERIALNUMBER=IIN123456789012, OU=BIN…).
-_BIN_IIN_RE = r"(?<![0-9])(?:IIN|BIN)?([0-9]{12})(?![0-9])"
-_BIN_IIN_MARKED_RE = r"(?:IIN|BIN)\s*[:=]?\s*[0-9]{12}"
+# Настоящие сертификаты НУЦ: SERIALNUMBER=IIN<12 цифр> (ИИН владельца/сотрудника),
+# у сертификатов ЮЛ дополнительно OU=BIN<12 цифр> (БИН организации).
+_LABELLED_BIN_IIN_RE = re.compile(
+    r"(?<![0-9A-Z])(BIN|IIN)\s*[:=]?\s*([0-9]{12})(?![0-9])", re.IGNORECASE
+)
+_BARE_BIN_IIN_RE = re.compile(r"\s*([0-9]{12})\s*")
+_CN_ATTRS = frozenset({"CN", "COMMONNAME", "2.5.4.3"})
+_SERIAL_ATTRS = frozenset({"SERIALNUMBER", "2.5.4.5"})
+_KZ_OID_PREFIX = "1.2.398."
+
+
+def _pick_bin_iin(pairs: Iterable[tuple[str, str]]) -> str:
+    """Выбирает БИН/ИИН из пар (атрибут, значение) subject сертификата.
+
+    Приоритет: BIN… (OU сертификата ЮЛ) → голые 12 цифр в атрибуте ветки OID
+    РК 1.2.398.* → IIN…/SERIALNUMBER (ИИН сотрудника или ИП). CN не
+    рассматривается: там бывают телефоны и прочие 12-значные числа.
+    """
+    bins: list[str] = []
+    kz_oid: list[str] = []
+    iins: list[str] = []
+    for name, value in pairs:
+        attr = name.strip().upper()
+        if attr in _CN_ATTRS:
+            continue
+        text = str(value)
+        labelled = _LABELLED_BIN_IIN_RE.findall(text)
+        for label, digits in labelled:
+            (bins if label.upper() == "BIN" else iins).append(digits)
+        if labelled:
+            continue
+        bare = _BARE_BIN_IIN_RE.fullmatch(text)
+        if bare is None:
+            continue
+        if attr.startswith(_KZ_OID_PREFIX):
+            kz_oid.append(bare.group(1))
+        elif attr in _SERIAL_ATTRS:
+            iins.append(bare.group(1))
+    for group in (bins, kz_oid, iins):
+        if group:
+            return group[0]
+    return ""
+
+
+def _bin_iin_from_dn(dn: str) -> str:
+    """БИН/ИИН из строки DN вида ``CN=…,SERIALNUMBER=IIN…,OU=BIN…``."""
+    pairs: list[tuple[str, str]] = []
+    for part in re.split(r"(?<!\\)[,+]", dn or ""):
+        name, sep, value = part.partition("=")
+        pairs.append((name, value) if sep else ("", part))
+    return _pick_bin_iin(pairs)
+
+
+def _normalize_bin_iin(value: Any) -> str:
+    """Значение явного поля binIin/iin/bin → 12 цифр либо пустая строка."""
+    if isinstance(value, bool) or value is None:
+        return ""
+    if isinstance(value, int):
+        return f"{value:012d}" if 0 <= value < 10**12 else ""
+    text = str(value).strip()
+    labelled = _pick_bin_iin([("VALUE", text)])
+    if labelled:
+        return labelled
+    digits = "".join(ch for ch in text if ch.isdigit())
+    return digits if len(digits) == 12 else ""
 
 
 def extract_bin_iin_from_certificate(cert: Any) -> str:
     """Достаёт БИН/ИИН (12 цифр) из сертификата ЭЦП РК.
 
-    Сертификаты НУЦ РК держат БИН/ИИН в атрибуте ``serialNumber`` (``SN``) с
-    префиксом ``IIN``/``BIN`` (профиль сертификата npck.kz) либо в
-    пользовательских OID ветки 1.2.398.3.3.4. Перебираем значения subject,
-    SubjectAlternativeName и расширений. Приоритет: значения с явной меткой
-    IIN/BIN → OID ветки РК → общий перебор (защита от «случайных» 12 цифр
-    вроде телефона в CN).
+    Для сертификата ЮЛ возвращается БИН организации (``OU=BIN…``), а не ИИН
+    сотрудника из ``SERIALNUMBER=IIN…``; для ФЛ/ИП — ИИН. Смотрим атрибуты
+    subject (OID и значение — разные поля атрибута) и SubjectAlternativeName.
     """
-    import re
-
-    candidates: list[str] = []
+    pairs: list[tuple[str, str]] = []
     try:
-        rfc_rdns = getattr(cert.subject, "rdns", None)
-        if rfc_rdns is not None:
-            for rdn in rfc_rdns:
-                for attribute in rdn:
-                    candidates.append(str(attribute.value))
-                    candidates.append(str(getattr(attribute, "oid", "")))
-        else:  # pragma: no cover - старые версии cryptography
-            candidates.append(str(cert.subject))
+        for rdn in cert.subject.rdns:
+            for attribute in rdn:
+                pairs.append((attribute.oid.dotted_string, str(attribute.value)))
 
         with contextlib.suppress(Exception):  # SAN может отсутствовать
             from cryptography import x509 as _x509
@@ -312,38 +372,10 @@ def extract_bin_iin_from_certificate(cert: Any) -> str:
                 _x509.SubjectAlternativeName,
             ).value
             for entry in san:
-                candidates.append(str(getattr(entry, "value", entry)))
-
-        for extension in cert.extensions:
-            with contextlib.suppress(Exception):  # нестандартные расширения
-                candidates.append(str(extension.value))
+                pairs.append(("SAN", str(getattr(entry, "value", entry))))
     except Exception:  # pragma: no cover - защита от нестандартных сертификатов
         return ""
-
-    def first_match(text: str) -> str:
-        match = re.search(_BIN_IIN_RE, text, re.IGNORECASE)
-        return match.group(1) if match else ""
-
-    # 1) Явно помеченные значения (IIN…/BIN… — префикс или «метка=номер»).
-    for value in candidates:
-        text = str(value)
-        if re.search(_BIN_IIN_MARKED_RE, text, re.IGNORECASE):
-            found = first_match(text)
-            if found:
-                return found
-    # 2) OID ветки РК (там лежит БИН/ИИН ЮЛ).
-    for value in candidates:
-        text = str(value)
-        if "1.2.398" in text and "=" in text:
-            found = first_match(text.split("=", 1)[-1])
-            if found:
-                return found
-    # 3) Общий перебор.
-    for value in candidates:
-        found = first_match(str(value))
-        if found:
-            return found
-    return ""
+    return _pick_bin_iin(pairs)
 
 
 def certificates_from_cms(der: bytes) -> list[Any]:
@@ -356,6 +388,127 @@ def certificates_from_cms(der: bytes) -> list[Any]:
         return []
 
 
+# DER-кодированный OID id-signedData (1.2.840.113549.1.7.2) без тега и длины.
+_OID_SIGNED_DATA = bytes.fromhex("2a864886f70d010702")
+
+
+def _ber_header(buf: bytes, pos: int) -> tuple[int, int, int | None]:
+    """(тег, начало значения, длина или None для неопределённой длины)."""
+    tag = buf[pos]
+    if tag & 0x1F == 0x1F:
+        raise ValueError("многобайтовые теги не поддерживаются")
+    first = buf[pos + 1]
+    pos += 2
+    if first < 0x80:
+        return tag, pos, first
+    if first == 0x80:
+        return tag, pos, None
+    count = first & 0x7F
+    if count > 4 or pos + count > len(buf):
+        raise ValueError("некорректная длина BER")
+    return tag, pos + count, int.from_bytes(buf[pos : pos + count], "big")
+
+
+def _ber_children(
+    buf: bytes, start: int, end: int | None
+) -> tuple[list[tuple[int, int, int]], int]:
+    """Дочерние TLV (тег, начало, конец значения) и позиция за контейнером.
+
+    Понимает и DER, и BER с неопределённой длиной (так кодирует CMS Java/BC).
+    """
+    items: list[tuple[int, int, int]] = []
+    pos = start
+    while True:
+        if end is None:
+            if buf[pos : pos + 2] == b"\x00\x00":
+                return items, pos + 2
+        elif pos >= end:
+            if pos != end:
+                raise ValueError("TLV выходит за границы контейнера")
+            return items, end
+        tag, value_start, length = _ber_header(buf, pos)
+        if length is None:
+            if not tag & 0x20:
+                raise ValueError("неопределённая длина у примитива")
+            _, after = _ber_children(buf, value_start, None)
+            items.append((tag, value_start, after - 2))
+            pos = after
+        else:
+            value_end = value_start + length
+            if value_end > len(buf):
+                raise ValueError("TLV обрезан")
+            items.append((tag, value_start, value_end))
+            pos = value_end
+
+
+def _ber_octets(buf: bytes, tag: int, start: int, end: int) -> bytes:
+    if tag == 0x04:
+        return buf[start:end]
+    if tag == 0x24:  # составной OCTET STRING (кусками)
+        kids, _ = _ber_children(buf, start, end)
+        return b"".join(_ber_octets(buf, *kid) for kid in kids)
+    raise ValueError("ожидался OCTET STRING")
+
+
+def cms_encapsulated_content(der: bytes) -> bytes | None:
+    """eContent CMS SignedData; None — не распознано или подпись отсоединённая."""
+    try:
+        (top,), _ = _ber_children(der, 0, len(der))
+        if top[0] != 0x30:
+            return None
+        info, _ = _ber_children(der, top[1], top[2])
+        if len(info) < 2 or info[0][0] != 0x06 or info[1][0] != 0xA0:
+            return None
+        if der[info[0][1] : info[0][2]] != _OID_SIGNED_DATA:
+            return None
+        (signed,), _ = _ber_children(der, info[1][1], info[1][2])
+        fields, _ = _ber_children(der, signed[1], signed[2])
+        encap = fields[2]
+        if encap[0] != 0x30:
+            return None
+        parts, _ = _ber_children(der, encap[1], encap[2])
+        if len(parts) < 2 or parts[1][0] != 0xA0:
+            return None
+        (content,), _ = _ber_children(der, parts[1][1], parts[1][2])
+        return _ber_octets(der, *content)
+    except (IndexError, ValueError, RecursionError):
+        return None
+
+
+def _is_greeting(payload: Any) -> bool:
+    """Приветствие NCALayer (``{"result": {"version": …}}``) — не ответ на запрос."""
+    if not isinstance(payload, dict):
+        return False
+    if "status" in payload or "code" in payload or "responseObject" in payload:
+        return False
+    result = payload.get("result")
+    return (isinstance(result, dict) and "version" in result) or "version" in payload
+
+
+# Признаки «этот NCALayer не принимает массив в args.data» (старые сборки).
+_BATCH_UNSUPPORTED_MARKERS = (
+    "array",
+    "массив",
+    "multisign",
+    "мультиподпис",
+    "classcast",
+)
+
+
+def _batch_unsupported(exc: NCALayerError) -> bool:
+    """Только отказ от массива даёт право на поштучную подпись.
+
+    Неверный пароль, отмена, таймаут, обрыв и рассинхрон повторять нельзя:
+    повтор = лишние диалоги и сожжённые попытки PIN токена.
+    """
+    if exc.is_user_cancel or exc.code.startswith("NCA_"):
+        return False
+    text = f"{exc.code} {exc} {exc.details}".lower()
+    if "password" in text or "парол" in text:
+        return False
+    return exc.code == "501" or any(m in text for m in _BATCH_UNSUPPORTED_MARKERS)
+
+
 # --------------------------------------------------------------------------- #
 # Клиент NCALayer
 # --------------------------------------------------------------------------- #
@@ -365,6 +518,10 @@ class NCALayerClient:
     Один экземпляр — один WebSocket. Вызовы сериализуются внутренним локом,
     поэтому ``recv()`` всегда соответствует отправленному запросу.
     """
+
+    # NCALayer шлёт приветствие сразу после подключения, но под нагрузкой
+    # оно может опоздать; опоздавшее всё равно отбрасывается в _recv_reply.
+    greeting_timeout: float = 3.0
 
     def __init__(
         self,
@@ -431,10 +588,14 @@ class NCALayerClient:
         """
         async with self._connect_lock:
             if self._ws is not None:
-                if self._ws_module == module:
+                is_open = self._ws.state is State.OPEN
+                if self._ws_module == module and is_open:
                     return self._ws
                 # Соединение открыто к другому модулю (у каждого модуля свой
-                # WS-путь) — переподключаемся, иначе запрос уйдёт не туда.
+                # WS-путь) либо уже закрыто (перезапуск NCALayer, сон ПК) —
+                # переподключаемся, иначе запрос уйдёт не туда или в никуда.
+                if not is_open:
+                    self.stats["reconnects"] += 1
                 await self._close_ws()
             url = self._module_url(module)
             self.log.debug("Подключение к NCALayer: %s", url)
@@ -473,12 +634,19 @@ class NCALayerClient:
             return ws
 
     async def _read_greeting(self, ws: ClientConnection) -> dict[str, Any] | None:
-        """NCALayer при подключении сам присылает приветствие/версию."""
+        """NCALayer при подключении сам присылает приветствие/версию.
+
+        Запросов по свежему сокету ещё не было, поэтому любое сообщение здесь —
+        приветствие, а не ответ.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.greeting_timeout
         for _ in range(3):
-            try:
-                raw = await asyncio.wait_for(ws.recv(), timeout=0.5)
-            except TimeoutError:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
                 return None
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
             except Exception:
                 return None
             try:
@@ -529,28 +697,32 @@ class NCALayerClient:
         }
 
     async def _rpc(
-        self, request: dict[str, Any], timeout: float, module: str = "basics"
+        self,
+        request: dict[str, Any],
+        timeout: float,
+        module: str = "basics",
+        validate: Callable[[Any], Any] | None = None,
     ) -> Any:
-        """Отправляет запрос и разбирает ответ (basics либо legacy-конверт)."""
+        """Отправляет запрос и разбирает ответ (basics либо legacy-конверт).
+
+        ``validate`` проверяет результат под тем же локом: при отказе сокет
+        сбрасывается, чтобы настоящий ответ не достался следующему запросу.
+        """
+        payload = json.dumps(request, ensure_ascii=False)
         async with self._send_lock:
-            try:
-                await self.connect(module)
-            except Exception as exc:
-                # Сюда попадают проблемы подключения (NCALayer не запущен,
-                # порт занят, TLS-несовместимость) — оборачиваем понятным
-                # сообщением, чтобы в GUI не всплывало сырое исключение.
-                self.stats["errors"] += 1
-                raise NCALayerError(
-                    "NCALayer недоступен. Убедитесь, что он запущен "
-                    f"({self.settings.host}:{self.settings.port}), затем повторите.",
-                    code="NCA_UNAVAILABLE",
-                    details=str(exc),
-                ) from exc
-            assert self._ws is not None
+            ws = await self._connect_for_rpc(module)
             self.stats["calls"] += 1
             try:
-                await self._ws.send(json.dumps(request, ensure_ascii=False))
-                raw = await asyncio.wait_for(self._ws.recv(), timeout=timeout)
+                try:
+                    await ws.send(payload)
+                except ConnectionClosed:
+                    # Запрос не ушёл (сокет умер между проверкой и отправкой) —
+                    # переподключаемся и отправляем ровно один раз повторно.
+                    self.log.info("NCALayer закрыл соединение — переподключаюсь")
+                    await self._reset()
+                    ws = await self._connect_for_rpc(module)
+                    await ws.send(payload)
+                reply = await self._recv_reply(ws, timeout)
             except asyncio.CancelledError:
                 # Отмена задачи (lock, disarm, закрытие окна) ОБЯЗАНА сбросить
                 # сокет: CancelledError — BaseException и общим except Exception
@@ -567,29 +739,70 @@ class NCALayerClient:
                 await self._reset()
                 raise NCALayerError(
                     "NCALayer не ответил за отведённое время",
+                    code="NCA_TIMEOUT",
                     details=f"timeout={timeout}s",
                 ) from exc
+            except NCALayerError:
+                raise
             except Exception as exc:
                 self.stats["errors"] += 1
                 await self._reset()
-                raise NCALayerError(f"Соединение с NCALayer потеряно: {exc}") from exc
+                raise NCALayerError(
+                    f"Соединение с NCALayer потеряно: {exc}",
+                    code="NCA_CONNECTION_LOST",
+                ) from exc
             expected_id = request.get("id")
             try:
-                response = self._parse_response(raw)
                 if (
                     expected_id is not None
-                    and isinstance(response, dict)
-                    and response.get("id") not in (None, expected_id)
+                    and isinstance(reply, dict)
+                    and reply.get("id") not in (None, expected_id)
                 ):
                     raise NCALayerError(
                         "NCALayer ответил на другой запрос (id не совпал)",
                         code="NCA_DESYNC",
                     )
+                result = self._parse_response(reply, module)
+                if validate is not None:
+                    result = validate(result)
             except Exception:
                 # Некорректный или чужой ответ тоже рассинхронизирует поток.
                 await self._reset()
                 raise
-            return response
+            return result
+
+    async def _connect_for_rpc(self, module: str) -> ClientConnection:
+        try:
+            return await self.connect(module)
+        except Exception as exc:
+            # Сюда попадают проблемы подключения (NCALayer не запущен,
+            # порт занят, TLS-несовместимость) — оборачиваем понятным
+            # сообщением, чтобы в GUI не всплывало сырое исключение.
+            self.stats["errors"] += 1
+            raise NCALayerError(
+                "NCALayer недоступен. Убедитесь, что он запущен "
+                f"({self.settings.host}:{self.settings.port}), затем повторите.",
+                code="NCA_UNAVAILABLE",
+                details=str(exc),
+            ) from exc
+
+    async def _recv_reply(self, ws: ClientConnection, timeout: float) -> Any:
+        """Читает ответ, отбрасывая опоздавшее приветствие NCALayer."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise TimeoutError
+            raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+            try:
+                payload = json.loads(raw)
+            except (ValueError, TypeError):
+                return raw  # отвергнет _parse_response
+            if not _is_greeting(payload):
+                return payload
+            self._greeting = payload
+            self.log.debug("Опоздавшее приветствие NCALayer пропущено")
 
     async def _reset(self) -> None:
         self.stats["reconnects"] += 1
@@ -622,13 +835,46 @@ class NCALayerClient:
                 for stale in list(self._seen_signatures)[:-128]:
                     self._seen_signatures.pop(stale, None)
 
-    def _parse_response(self, raw: str | bytes) -> Any:
+    def _check_cms_content(self, key: str, raw: bytes, signature_b64: str) -> None:
+        """Встроенная CMS обязана содержать именно этот документ.
+
+        Нераспознанная CMS (или отсоединённая подпись) не блокирует подачу —
+        отвергаем только доказанное несовпадение.
+        """
+        if not self.settings.cms_encapsulate:
+            return
         try:
-            response = json.loads(raw)
-        except (ValueError, TypeError) as exc:
-            raise NCALayerError("Некорректный ответ NCALayer") from exc
+            der = base64.b64decode(signature_b64)
+        except Exception:
+            return
+        content = cms_encapsulated_content(der)
+        if content is None or content in (raw, b64encode(raw).encode("ascii")):
+            return
+        # S/MIME-подписанты в «текстовом» режиме приводят LF к CRLF — это не
+        # чужой документ; подачу из-за переводов строк не блокируем.
+        if content.replace(b"\r\n", b"\n") == raw.replace(b"\r\n", b"\n"):
+            return
+        self.stats["errors"] += 1
+        raise NCALayerError(
+            "Подпись NCALayer относится к другому документу",
+            code="NCA_SIGNATURE_MISMATCH",
+            details=f"«{key}»: подписанное содержимое не совпадает с документом",
+        )
+
+    def _parse_response(self, raw: Any, module: str = "basics") -> Any:
+        if isinstance(raw, dict):
+            response = raw
+        else:
+            try:
+                response = json.loads(raw)
+            except (ValueError, TypeError) as exc:
+                raise NCALayerError(
+                    "Некорректный ответ NCALayer", code="NCA_BAD_REPLY"
+                ) from exc
         if not isinstance(response, dict):
-            raise NCALayerError("Неожиданный формат ответа NCALayer")
+            raise NCALayerError(
+                "Неожиданный формат ответа NCALayer", code="NCA_BAD_REPLY"
+            )
 
         # --- новый модуль kz.gov.pki.knca.basics ---
         if "status" in response:
@@ -642,6 +888,15 @@ class NCALayerClient:
             if not isinstance(body, dict) or "result" not in body:
                 raise NCALayerError("Операция отменена пользователем", canceled=True)
             return body["result"]
+
+        # Модуль basics всегда отвечает со status: всё прочее (приветствие,
+        # мусор) — не ответ на наш запрос, а не «успех по умолчанию».
+        if module != "legacy" or not ({"code", "responseObject"} & response.keys()):
+            raise NCALayerError(
+                "NCALayer прислал сообщение неизвестного формата",
+                code="NCA_BAD_REPLY",
+                details=str(sorted(response.keys()))[:200],
+            )
 
         # --- старый модуль kz.gov.pki.knca (commonUtils) ---
         code = str(response.get("code", "200"))
@@ -713,7 +968,8 @@ class NCALayerClient:
                 )
                 return docs
             except NCALayerError as exc:
-                if exc.is_user_cancel or not self.settings.batch_fallback_sequential:
+                fallback = self.settings.batch_fallback_sequential
+                if not (fallback and _batch_unsupported(exc)):
                     raise
                 self.log.warning(
                     "Пакетный вызов отклонён NCALayer (%s) — перехожу к "
@@ -778,14 +1034,22 @@ class NCALayerClient:
         args = self._build_sign_args(
             [b64encode(raw) for _, raw in loaded], fmt, password
         )
-        result = await self._rpc(
+
+        def validate(result: Any) -> list[str]:
+            signatures = self._extract_signatures(result, len(loaded))
+            if fmt == "cms":
+                for (item, raw), signature in zip(loaded, signatures, strict=True):
+                    self._check_cms_content(item.key, raw, signature)
+            for (item, _raw), signature in zip(loaded, signatures, strict=True):
+                self._check_signature_owner(item.key, signature)
+            return signatures
+
+        signatures: list[str] = await self._rpc(
             self._envelope("basics", "sign", args),
             timeout,
             "basics",
+            validate=validate,
         )
-        signatures = self._extract_signatures(result, len(loaded))
-        for (item, _raw), signature in zip(loaded, signatures, strict=True):
-            self._check_signature_owner(item.key, signature)
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         per_doc_ms = elapsed_ms / max(len(loaded), 1)
         documents: list[SignedDocument] = []
@@ -815,13 +1079,22 @@ class NCALayerClient:
             raw = await asyncio.to_thread(item.load)
             fmt = "xml" if item.mode is SignMode.XML else "cms"
             args = self._build_sign_args(b64encode(raw), fmt, password)
-            result = await self._rpc(
+
+            def validate(
+                result: Any, key: str = item.key, raw: bytes = raw, fmt: str = fmt
+            ) -> str:
+                signature = self._extract_signatures(result, 1)[0]
+                if fmt == "cms":
+                    self._check_cms_content(key, raw, signature)
+                self._check_signature_owner(key, signature)
+                return signature
+
+            signature: str = await self._rpc(
                 self._envelope("basics", "sign", args),
                 timeout,
                 "basics",
+                validate=validate,
             )
-            signature = self._extract_signatures(result, 1)[0]
-            self._check_signature_owner(item.key, signature)
             self.stats["signatures"] += 1
             documents.append(
                 SignedDocument(
@@ -887,6 +1160,7 @@ class NCALayerClient:
         if len(signatures) != expected:
             raise NCALayerError(
                 "NCALayer вернул неожиданное число подписей",
+                code="NCA_SIGNATURE_COUNT",
                 details=f"expected={expected}, got={len(signatures)}",
             )
         return signatures
@@ -919,6 +1193,7 @@ __all__ = [
     "b64decode",
     "b64encode",
     "certificates_from_cms",
+    "cms_encapsulated_content",
     "extract_bin_iin_from_certificate",
     "make_items",
     "sha256_hex",

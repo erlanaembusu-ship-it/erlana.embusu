@@ -7,8 +7,9 @@
   https://ows.goszakup.gov.kz/help/v3/schema/trdbuy.doc.html — «Дата начала
   приема заявок»). Для повторных закупок портал публикует ``repeatStartDate``.
 * **Часы синхронизируются с сервером.** Смещение считается по заголовку
-  ``Date`` ответа (берём выборку с минимальным RTT — классический NTP-приём),
-  поэтому локальные кривые часы не сдвигают выстрел.
+  ``Date`` ответа: каждая выборка задаёт интервал допустимых смещений, интервалы
+  пересекаются, а зонды на смене секунды сужают погрешность до уровня RTT
+  (``refine_clock``), поэтому локальные кривые часы не сдвигают выстрел.
 * **Расписание адаптивное.** Чем ближе T0, тем чаще опрос: от 180 с за три
   часа до 200 мс у самого открытия. Жёсткий пол — ``min_interval_hard``,
   чтобы не «долбить» портал.
@@ -20,7 +21,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import math
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -130,23 +133,32 @@ def _zone(tz_name: str) -> timezone | ZoneInfo:
 class ClockSync:
     """Смещение локальных часов относительно часов портала.
 
-    Нюанс точности: заголовок ``Date`` в HTTP имеет разрешение 1 секунда и
-    округляется ВНИЗ, поэтому каждая выборка занижает смещение на случайную
-    долю секунды (0…1 с). Лучшей оценкой является МАКСИМУМ смещений по
-    выборкам, а не выборка с минимальным RTT: сетевой джиттер на порядок
-    меньше этой секундной «ступеньки». Системные часы не трогаем —
-    пересчёт «сейчас по серверу» делается на лету.
+    Заголовок ``Date`` имеет разрешение 1 с и округляется ВНИЗ, поэтому одна
+    выборка задаёт не точку, а интервал ``[D − received, D + 1 − sent]``.
+    Интервалы всех выборок пересекаются, оценка — середина пересечения.
+    Точечная оценка (min-RTT или max) занижала смещение на 0…1 с, и T0
+    срабатывал с опозданием до секунды. Повтор запроса лишь расширяет
+    интервал своей выборки и оценку не сдвигает. Системные часы не трогаем.
     """
 
     offset_s: float = 0.0
     best_rtt_ms: float = float("inf")
     samples: int = 0
     last_sync_at: float = 0.0
+    low_s: float = float("-inf")
+    high_s: float = float("inf")
+
+    @property
+    def uncertainty_ms(self) -> float:
+        """Полуширина интервала смещения (inf — выборок ещё не было)."""
+        if not self.samples:
+            return float("inf")
+        return (self.high_s - self.low_s) * 500.0
 
     def update_from_headers(
         self, headers: Mapping[str, str], sent_at: float, received_at: float
     ) -> bool:
-        """Обновляет смещение по заголовку ``Date`` ответа."""
+        """Сужает интервал смещения по заголовку ``Date``; True — оценка изменилась."""
         raw_date = headers.get("date") or headers.get("Date")
         if not raw_date:
             return False
@@ -158,18 +170,23 @@ class ClockSync:
             return False
         if server_dt.tzinfo is None:
             server_dt = server_dt.replace(tzinfo=timezone.utc)
+        server_s = server_dt.timestamp()
         rtt_ms = (received_at - sent_at) * 1000.0
-        local_mid = sent_at + (received_at - sent_at) / 2.0
-        offset = server_dt.timestamp() - local_mid
         self.samples += 1
         self.best_rtt_ms = min(self.best_rtt_ms, rtt_ms)
         self.last_sync_at = time.time()
-        # Классический NTP-приём: смещение берётся из замера с МИНИМАЛЬНЫМ
-        # RTT (повтор/потеря пакета завышают смещение — раньше брался max).
-        if self.samples == 1 or rtt_ms <= self.best_rtt_ms:
-            self.offset_s = offset
-            return True
-        return False
+        low = server_s - received_at
+        high = server_s + 1.0 - sent_at
+        new_low = max(self.low_s, low)
+        new_high = min(self.high_s, high)
+        if new_low > new_high:
+            # Выборка противоречит накопленной оценке: часы (локальные или
+            # серверные) переведены — начинаем с этой выборки.
+            new_low, new_high = low, high
+        changed = (new_low, new_high) != (self.low_s, self.high_s)
+        self.low_s, self.high_s = new_low, new_high
+        self.offset_s = (new_low + new_high) / 2.0
+        return changed
 
     def server_now(self) -> float:
         """Текущее время сервера (epoch-секунды)."""
@@ -180,7 +197,7 @@ class ClockSync:
 
     def describe(self) -> str:
         return (
-            f"смещение {self.offset_s * 1000:+.0f} мс "
+            f"смещение {self.offset_s * 1000:+.0f} ±{self.uncertainty_ms:.0f} мс "
             f"(RTT {self.best_rtt_ms:.0f} мс, проб {self.samples})"
         )
 
@@ -354,6 +371,7 @@ class LotWatcher:
         self._last_fingerprint: tuple[str, str, str] | None = None
         self._t0_hit = asyncio.Event()
         self._timer_task: asyncio.Task[None] | None = None
+        self._refine_task: asyncio.Task[Any] | None = None
         self.last_state: LotState | None = None
 
     # -- расписание --------------------------------------------------------- #
@@ -462,47 +480,77 @@ class LotWatcher:
         не запускается (``allow_relogin=False``).
         """
         count = samples or self.settings.watcher.clock_sync_samples
-        endpoints = self.settings.endpoints
-        if self.settings.cabinet_api_verified:
-            targets = [
-                ("GET", endpoints.cabinet_url(endpoints.session_ping_path), None),
-                ("GET", endpoints.cabinet_url(endpoints.auth_challenge_path), None),
-            ]
-        else:
-            # LIVE: пути кабинета не подтверждены — меряем по реестру OWS.
-            # Заголовок Date есть и в ответе 401, токен для часов не обязателен.
-            targets = [
-                (
-                    "POST",
-                    endpoints.graphql_url(),
-                    {"query": "{ __typename }"},
-                )
-            ]
+        targets = self._clock_targets()
         for index in range(max(1, count)):
-            method, url, body = targets[index % len(targets)]
-            try:
-                sent_at = time.time()
-                response = await self.session.request(
-                    method,
-                    url,
-                    json=body,
-                    headers=self._ows_headers() if body is not None else None,
-                    allow_relogin=False,
-                    timeout=self.settings.timeouts.read,
-                )
-                received_at = time.time()
-                self.clock.update_from_headers(
-                    response.headers,
-                    sent_at,
-                    received_at,
-                )
-            except Exception as exc:
-                self.log.debug("Синхронизация часов: %s", exc)
+            await self._clock_probe(*targets[index % len(targets)])
             await asyncio.sleep(0.05)
         if self.clock.samples:
             self.log.info("Часы синхронизированы: %s", self.clock.describe())
         else:
             self.log.warning("Часы сервера не синхронизированы — работаем по локальным")
+        return self.clock
+
+    def _clock_targets(self) -> list[tuple[str, str, dict[str, Any] | None]]:
+        endpoints = self.settings.endpoints
+        if self.settings.cabinet_api_verified:
+            return [
+                ("GET", endpoints.cabinet_url(endpoints.session_ping_path), None),
+                ("GET", endpoints.cabinet_url(endpoints.auth_challenge_path), None),
+            ]
+        # LIVE: пути кабинета не подтверждены — меряем по реестру OWS.
+        # Заголовок Date есть и в ответе 401, токен для часов не обязателен.
+        return [("POST", endpoints.graphql_url(), {"query": "{ __typename }"})]
+
+    async def _clock_probe(
+        self, method: str, url: str, body: dict[str, Any] | None
+    ) -> None:
+        try:
+            sent_at = time.time()
+            response = await self.session.request(
+                method,
+                url,
+                json=body,
+                headers=self._ows_headers() if body is not None else None,
+                allow_relogin=False,
+                timeout=self.settings.timeouts.read,
+            )
+            received_at = time.time()
+            self.clock.update_from_headers(response.headers, sent_at, received_at)
+        except Exception as exc:
+            self.log.debug("Синхронизация часов: %s", exc)
+
+    async def refine_clock(
+        self, target_ms: float | None = None, max_probes: int | None = None
+    ) -> ClockSync:
+        """Сужает погрешность часов зондами на смене секунды сервера.
+
+        Зонд отправляется так, чтобы по текущей оценке сервер обработал его
+        ровно на границе секунды: пришедший ``Date`` отсекает половину
+        интервала. ~6 зондов (по одному в секунду) дают точность порядка
+        RTT/2 вместо «до ±0.5 с» у разовых выборок.
+        """
+        cfg = self.settings.watcher
+        target = cfg.clock_target_ms if target_ms is None else target_ms
+        probes = cfg.clock_refine_probes if max_probes is None else max_probes
+        targets = self._clock_targets()
+        if not self.clock.samples:
+            await self._clock_probe(*targets[0])
+        for index in range(max(0, probes)):
+            clock = self.clock
+            if not clock.samples:
+                break
+            rtt_s = (
+                clock.best_rtt_ms / 1000.0 if math.isfinite(clock.best_rtt_ms) else 0
+            )
+            # Уже ниже RTT/2 интервал заметно не сузить.
+            if clock.uncertainty_ms <= max(target, rtt_s * 500.0 + 5.0):
+                break
+            boundary = math.ceil(time.time() + 0.05 + rtt_s / 2.0 + clock.offset_s)
+            send_at = boundary - clock.offset_s - rtt_s / 2.0
+            await asyncio.sleep(max(0.0, send_at - time.time()))
+            await self._clock_probe(*targets[index % len(targets)])
+        if self.clock.samples:
+            self.log.info("Часы уточнены: %s", self.clock.describe())
         return self.clock
 
     # -- таймер T0 ---------------------------------------------------------- #
@@ -570,8 +618,11 @@ class LotWatcher:
         )
 
     def stop(self) -> None:
-        """Останавливает таймер (например, при отмене взведённой заявки)."""
+        """Останавливает таймер и уточнение часов (например, при отмене заявки)."""
         self._cancel_timer()
+        task, self._refine_task = self._refine_task, None
+        if task is not None and not task.done():
+            task.cancel()
 
     async def _sleep(
         self,
@@ -586,12 +637,42 @@ class LotWatcher:
             left_deadline = deadline_monotonic - time.monotonic()
             interval = min(interval, max(0.01, left_deadline))
         if t0_epoch is None:
-            await asyncio.sleep(max(0.01, interval))
+            await self._wait_t0_hit(max(0.01, interval))
             return
         left = t0_epoch - self.clock.server_now()
         # Минимум 10 мс: без него у самого T0 получается «холостое» вращение,
         # выжигающее CPU в ожидании срабатывания локального таймера.
-        await asyncio.sleep(max(0.01, min(interval, left)))
+        await self._wait_t0_hit(max(0.01, min(interval, left)))
+
+    async def _wait_t0_hit(self, seconds: float) -> None:
+        """Сон, который прерывает таймер T0 (уточнение часов может сдвинуть его)."""
+        if self._t0_hit.is_set():
+            return
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(seconds):
+                await self._t0_hit.wait()
+
+    async def _fetch_or_t0(self, lot_id: int) -> tuple[bool, LotState | None]:
+        """Опрос лота, который не задерживает выстрел: T0 важнее ответа реестра.
+
+        Возвращает ``(True, None)``, если таймер T0 сработал раньше ответа.
+        """
+        if self._t0_hit.is_set():
+            return True, None
+        fetch = asyncio.ensure_future(self.fetch(lot_id))
+        hit = asyncio.ensure_future(self._t0_hit.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {fetch, hit}, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            hit.cancel()
+            if not fetch.done():
+                fetch.cancel()
+        if fetch in done:
+            return False, fetch.result()
+        await asyncio.gather(fetch, return_exceptions=True)
+        return True, None
 
     def _emit_state(
         self, state: LotState, callback: Callable[[LotState], None] | None
@@ -645,6 +726,15 @@ class LotWatcher:
                 self._arm_timer(t0_epoch)
                 left = t0_epoch - self.clock.server_now()
                 self.session.set_t0(time.monotonic() + max(0.0, left))
+                if deadline_monotonic is None:
+                    # Лимит наблюдения не должен истечь раньше T0 (взвод с вечера).
+                    hard_deadline = max(hard_deadline, time.monotonic() + left + 60.0)
+                # Уточнение часов в фоне: таймер перечитывает server_now() на
+                # каждом шаге и подхватит новую оценку сам.
+                if left > cfg.clock_refine_min_lead_s and cfg.clock_refine_probes > 0:
+                    self._refine_task = asyncio.create_task(
+                        self.refine_clock(), name="clock-refine"
+                    )
                 self.log.info(
                     "T0: %s (через %.1f с). %s",
                     state.start_dt(cfg.portal_tz),
@@ -684,12 +774,12 @@ class LotWatcher:
                 await self._sleep(interval, sleep_target, hard_deadline)
 
                 try:
-                    fresh = await self.fetch(lot_id)
+                    t0_hit, fresh = await self._fetch_or_t0(lot_id)
                 except PortalError as exc:
                     self.log.warning("Сбой опроса лота: %s", exc)
-                    await asyncio.sleep(min(interval * 2, 2.0))
+                    await self._wait_t0_hit(min(interval * 2, 2.0))
                     continue
-                if fresh is None:
+                if t0_hit or fresh is None:
                     continue
                 state = fresh
                 self._emit_state(state, on_state)

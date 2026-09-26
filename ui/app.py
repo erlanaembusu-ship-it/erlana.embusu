@@ -397,6 +397,10 @@ class Backend:
                 run_id=record.run_id,
                 state=state.to_dict(),
                 t0_epoch=t0,
+                # Остаток — по часам сервера, как в snapshot(), иначе отсчёт
+                # на карточке прыгал на величину ухода часов ПК.
+                left_s=(t0 - watch.clock.server_now()) if (watch and t0) else None,
+                mono=time.monotonic(),
             )
 
         try:
@@ -463,6 +467,7 @@ class Backend:
                 }
             )
         snap["armed_detail"] = armed
+        snap["snap_mono"] = time.monotonic()
         return snap
 
     # -- снимок для UI ------------------------------------------------------ #
@@ -1599,7 +1604,8 @@ class FastBidApp(ctk.CTk):
         self._callbacks.put(apply)
 
     def _apply_snapshot(self, snap: dict[str, Any]) -> None:
-        self._snapshot_at = time.monotonic()
+        # Точка отсчёта — момент расчёта снимка, а не применения в UI.
+        self._snapshot_at = float(snap.get("snap_mono") or time.monotonic())
         self._session_light.set(
             snap.get("session_label", "—"),
             snap.get("session_color", "#7a8290"),
@@ -1683,6 +1689,7 @@ class FastBidApp(ctk.CTk):
             lot_id = int(payload.get("lot_id", 0))
             state = payload.get("state") or {}
             t0 = payload.get("t0_epoch") or 0.0
+            left_s = payload.get("left_s")
             card = self._cards.get(lot_id)
             if card is not None:
                 card.set_meta(
@@ -1691,13 +1698,12 @@ class FastBidApp(ctk.CTk):
                     str(state.get("status_name", "") or state.get("status_id", "")),
                     str(state.get("start_date", "")),
                 )
-            if t0:
+            if t0 and left_s is not None:
                 # ``_left`` интерпретируется в ``_tick`` как «остаток на момент
                 # ``_snapshot_at``» — приводим к той же точке отсчёта, иначе
                 # обратный отсчёт «прыгает» между событием и снимком.
-                self._left[lot_id] = (
-                    float(t0) - time.time() + (time.monotonic() - self._snapshot_at)
-                )
+                mono = float(payload.get("mono") or time.monotonic())
+                self._left[lot_id] = float(left_s) + (mono - self._snapshot_at)
         elif event == "stage":
             card = self._cards.get(int(payload.get("lot_id", 0)))
             if card is not None:
@@ -1743,19 +1749,20 @@ class FastBidApp(ctk.CTk):
         stages = payload.get("stages") or {}
         if stages.get("submit"):
             self._pill_submit.set(f"{stages['submit']:.0f} мс")
+        # Модальное окно — отдельным callback'ом: внутри _tick оно блокировало
+        # перепланирование, и у остальных взведённых лотов вставал отсчёт.
         if ok:
-            messagebox.showinfo(
-                "FastBid",
+            text = (
                 "DRY-RUN завершён. Подпись, загрузка и подача не выполнялись."
                 if dry_run
-                else f"Заявка подана: {payload.get('bid_id', '')}",
+                else f"Заявка подана: {payload.get('bid_id', '')}"
             )
+            self.after(0, lambda: messagebox.showinfo("FastBid", text))
         else:
-            messagebox.showwarning(
-                "FastBid",
-                "Подача не удалась:\n"
-                + "\n".join(str(item) for item in (payload.get("errors") or ["—"])),
+            text = "Подача не удалась:\n" + "\n".join(
+                str(item) for item in (payload.get("errors") or ["—"])
             )
+            self.after(0, lambda: messagebox.showwarning("FastBid", text))
 
     # -- закрытие ------------------------------------------------------------ #
     def _on_close(self) -> None:
