@@ -722,6 +722,7 @@ class MockPortal:
         payload = request.json if isinstance(request.json, dict) else {}
         variables = payload.get("variables") or {}
         ids = variables.get("ids") or []
+        anno = variables.get("anno") or []
         try:
             lot_id = int(ids[0]) if ids else self.lot.id
         except (TypeError, ValueError):
@@ -732,7 +733,13 @@ class MockPortal:
             await conn.send(304, b"", extra_headers={"ETag": etag})
             return
         self.lot.refresh()
-        nodes = [self.lot.to_node()] if lot_id == self.lot.id else []
+        # Фильтр по объявлению (trdBuyId) — автопилот: ID может быть номером
+        # объявления, а не лота.
+        try:
+            by_anno = bool(anno) and int(anno[0]) == self.lot.trd_buy_id
+        except (TypeError, ValueError):
+            by_anno = False
+        nodes = [self.lot.to_node()] if (lot_id == self.lot.id or by_anno) else []
         await conn.send_json(
             200,
             {"data": {"Lots": nodes}},

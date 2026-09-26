@@ -29,7 +29,7 @@ from typing import Any
 
 import customtkinter as ctk
 
-from config.niche_blueprints import BLUEPRINTS
+from config.niche_blueprints import BLUEPRINTS, DocKind, resolve_blueprint
 from config.settings import (
     APP_NAME,
     APP_VERSION,
@@ -237,6 +237,100 @@ class Backend:
             "Режим директора: ЭЦП загружена (алиас %s), диалоги подписи отключены",
             alias or "—",
         )
+
+    # -- автопилот ----------------------------------------------------------- #
+    def _autopilot_request(
+        self,
+        state: LotState,
+        blueprint: Any,
+        dry_run: bool | None,
+    ) -> BidRequest:
+        """Авто-сборка BidRequest: документы из doc_dir по шаблонам ниши."""
+        import fnmatch
+
+        doc_dir = Path(self.settings.profile.doc_dir)
+        files: list[Path] = []
+        if doc_dir.exists():
+            files = sorted(
+                (p for p in doc_dir.rglob("*") if p.is_file()),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        documents: list[Path] = []
+        slots: dict[str, Path] = {}
+        specs = (
+            *blueprint.required_documents,
+            *(d for d in blueprint.documents if not d.required),
+        )
+        for spec in specs:
+            if spec.key in slots:
+                continue
+            for path in files:
+                if path in documents:
+                    continue
+                if any(
+                    fnmatch.fnmatch(path.name.lower(), pattern.lower())
+                    for pattern in spec.patterns
+                ):
+                    slots[spec.key] = path
+                    documents.append(path)
+                    break
+        return BidRequest(
+            lot_id=state.lot_id,
+            blueprint_id=blueprint.id,
+            documents=documents,
+            document_slots=slots,
+            dry_run=(
+                bool(dry_run) if dry_run is not None else self.settings.dry_run
+            ),
+        )
+
+    async def autopilot(self, ref: int, dry_run: bool | None = None) -> dict[str, Any]:
+        """Автопилот: ID объявления/лота → ниша, документы, взвод — автоматически.
+
+        Пользователь указывает только номер. Документы подбираются из папки
+        docs по шаблонам ниши; недостающие обязательные — в отчёте.
+        """
+        state, via_announcement = await self.watcher.resolve_reference(ref)
+        blueprint = resolve_blueprint(f"{state.name} {state.description}")
+        request = self._autopilot_request(state, blueprint, dry_run)
+        self.arm(state.lot_id, blueprint.id, request)
+        self.start_armed(self.armed[state.lot_id])
+        matched = sorted(request.document_slots)
+        # «Недостающие» — только те, что поставщик прикладывает сам
+        # (GENERATED формирует приложение, LOT_DOC приходит с портала).
+        missing = [
+            d.label
+            for d in blueprint.required_documents
+            if d.key not in request.document_slots
+            and d.kind is not DocKind.GENERATED
+        ]
+        report = {
+            "lot_id": state.lot_id,
+            "lot_number": state.lot_number,
+            "name": state.name,
+            "amount": state.amount,
+            "via_announcement": via_announcement,
+            "blueprint": blueprint.title_ru,
+            "blueprint_id": blueprint.id,
+            "request": request,
+            "docs_matched": matched,
+            "docs_missing": missing,
+            "dry_run": request.dry_run,
+        }
+        self.log.info(
+            "Автопилот: %sлот %s «%s» — ниша «%s», документы: %s",
+            "по объявлению → " if via_announcement else "",
+            report["lot_number"],
+            state.name[:60],
+            report["blueprint"],
+            ", ".join(matched) or "не подобраны",
+        )
+        if missing:
+            self.log.warning(
+                "Нет обязательных документов: %s", ", ".join(missing)
+            )
+        return report
 
     async def stop_session(self) -> None:
         await self.lock_session()
@@ -737,6 +831,19 @@ class FastBidApp(ctk.CTk):
         ctk.CTkButton(
             form, text="Сохранить лот", width=150, command=self._on_add_lot
         ).pack(side="left", padx=(12, 0))
+
+        ctk.CTkButton(
+            form,
+            text="Автопилот",
+            width=120,
+            command=self._on_autopilot,
+        ).pack(side="left", padx=(8, 0))
+        ctk.CTkLabel(
+            form,
+            text="ID лота или объявления → всё автоматически",
+            font=ctk.CTkFont(size=11),
+            text_color=COLORS["dim"],
+        ).pack(side="left", padx=(8, 0))
 
         docs = ctk.CTkFrame(tab, fg_color="transparent")
         docs.pack(fill="x", padx=8, pady=(8, 0))
@@ -1260,6 +1367,51 @@ class FastBidApp(ctk.CTk):
             self._docs_label.configure(
                 text=f"Выбрано: {len(self._chosen_docs)} файл(ов)",
             )
+
+    def _on_autopilot(self) -> None:
+        """Автопилот: ID лота/объявления → ниша, документы, взвод — автоматически."""
+        raw = (self._entry_lot.get() or "").strip()
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        if len(digits) < 6:
+            messagebox.showwarning(
+                "Автопилот",
+                "Укажите номер объявления или лота\n(например 17630537 или 87753776).",
+            )
+            return
+        ref = int(digits)
+        if self.backend.is_armed(ref) or any(
+            armed.lot_id == ref for _, armed in self.backend._records()
+        ):
+            messagebox.showwarning("Автопилот", "Лот уже взведён.")
+            return
+
+        future = self.bridge.submit(self.backend.autopilot(ref))
+
+        def done() -> None:
+            try:
+                report = future.result()
+            except Exception as exc:
+                self.log.error("Автопилот: %s", exc)
+                messagebox.showerror("Автопилот", str(exc))
+                return
+            lot_id = report["lot_id"]
+            self._requests[lot_id] = report["request"]
+            self._upsert_card(lot_id, report["lot_number"], report["blueprint_id"])
+            self.log.success(
+                "Автопилот: лот %s (%s), ниша «%s», документы: %s; режим %s",
+                report["lot_number"],
+                lot_id,
+                report["blueprint"],
+                ", ".join(report["docs_matched"]) or "не подобраны",
+                "DRY-RUN" if report["dry_run"] else "LIVE",
+            )
+            if report["docs_missing"]:
+                self.log.warning(
+                    "Не хватает обязательных документов: %s",
+                    ", ".join(report["docs_missing"]),
+                )
+
+        future.add_done_callback(lambda _f: self._callbacks.put(done))
 
     def _on_add_lot(self) -> None:
         text = self._entry_lot.get().strip()

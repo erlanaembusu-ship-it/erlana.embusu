@@ -472,6 +472,54 @@ class LotWatcher:
         self.last_state = state
         return state
 
+    async def resolve_reference(self, ref: int) -> tuple[LotState, bool]:
+        """Автопилот: ID — это лот или объявление? Возвращает (лот, признак).
+
+        1. Пробуем ID как номер лота в реестре.
+        2. Если лота нет — как номер объявления (TrdBuy): берём его лоты.
+           Один лот → берём его; несколько → ошибка со списком номеров
+           (выбрать лот — единственное, что не автоматизируется).
+        """
+        try:
+            return await self.fetch(int(ref), conditional=False), False
+        except PortalError as exc:
+            if getattr(exc, "status", 0) != 404:
+                raise
+        result = await self.session.graphql(
+            "query LotsByAnno($anno: [Int!], $limit: Int!) {"
+            "  Lots(filter: {trdBuyId: $anno}, limit: $limit) {"
+            "    id lotNumber nameRu refLotStatusId"
+            "  }"
+            "}",
+            variables={"anno": [int(ref)], "limit": 50},
+        )
+        # session.graphql возвращает уже развёрнутый "data" — Lots на верхнем
+        # уровне.
+        lots = result.get("Lots") or []
+        if not lots:
+            raise PortalError(
+                f"ID {ref}: не найдено ни лота, ни объявления в реестре",
+                status=404,
+                code="REF_NOT_FOUND",
+            )
+        if len(lots) > 1:
+            numbers = ", ".join(
+                str(item.get("lotNumber") or item.get("id")) for item in lots
+            )
+            raise PortalError(
+                f"Объявление {ref} содержит {len(lots)} лотов ({numbers}) — "
+                "укажите номер конкретного лота",
+                code="REF_AMBIGUOUS",
+            )
+        lot_id = int(lots[0].get("id") or 0)
+        state = await self.fetch(lot_id, conditional=False)
+        if state is None:
+            raise PortalError(
+                f"Лот объявления {ref} (id={lot_id}) недоступен в реестре",
+                status=404,
+            )
+        return state, True
+
     async def sync_clock(self, samples: int | None = None) -> ClockSync:
         """Оценка смещения часов сервера (вызывать при взводе заявки).
 

@@ -1196,3 +1196,77 @@ def test_sign_args_include_key_alias_in_director_mode(settings) -> None:
     assert args2["keyAlias"] == "910103351659"
     # пароль ЭЦП пробрасывается в signerParams (диалог пароля не нужен)
     assert args2["signerParams"]["password"] == "pw"
+
+
+def test_resolve_reference_by_announcement(settings) -> None:
+    """Автопилот: номер объявления → единственный лот этого объявления."""
+    import asyncio
+
+    from core.lot_watcher import LotWatcher
+
+    async def scenario() -> dict:
+        servers = MockServers(open_after_s=3600.0, nca_password=PASSWORD)
+        await servers.start()
+        try:
+            mock_settings = servers.settings_for(settings)
+            nca = NCALayerClient(mock_settings.ncalayer)
+            session = SessionManager(mock_settings, nca)
+            await session.start()
+            watcher = LotWatcher(session, mock_settings)
+            try:
+                state, via_announcement = await watcher.resolve_reference(
+                    servers.portal.lot.trd_buy_id
+                )
+                return {
+                    "lot_id": state.lot_id,
+                    "mock_lot_id": servers.portal.lot.id,
+                    "via": via_announcement,
+                }
+            finally:
+                await session.close()
+                await nca.close()
+        finally:
+            await servers.stop()
+
+    report = asyncio.run(scenario())
+    assert report["via"] is True
+    assert report["lot_id"] == report["mock_lot_id"]
+
+
+def test_backend_autopilot_arms_from_announcement(tmp_path, settings) -> None:
+    """Автопилот: номер объявления → ниша, документы из doc_dir, взвод."""
+    import asyncio
+
+    from ui.app import Backend, UiEventQueue
+
+    async def scenario() -> dict:
+        servers = MockServers(open_after_s=3600.0, nca_password=PASSWORD)
+        await servers.start()
+        backend = None
+        try:
+            mock = servers.settings_for(settings)
+            docs = tmp_path / "docs"
+            docs.mkdir()
+            (docs / "cert_supplier.pdf").write_bytes(b"%PDF cert")
+            (docs / "tz_project.pdf").write_bytes(b"%PDF tz")
+            mock = mock.with_(
+                profile=replace(mock.profile, doc_dir=docs),
+            )
+            backend = Backend(mock, UiEventQueue())
+            await backend.start_session()
+            backend.bind_loop(asyncio.get_running_loop())
+            report = await backend.autopilot(servers.portal.lot.trd_buy_id)
+            armed = backend.is_armed(report["lot_id"])
+            await backend.lock_session()
+            return {"armed": armed, **report}
+        finally:
+            if backend is not None:
+                await backend.ncalayer.close()
+            await servers.stop()
+
+    report = asyncio.run(scenario())
+    assert report["armed"] is True
+    assert report["via_announcement"] is True
+    assert report["docs_missing"] == []
+    assert "cert" in " ".join(report["docs_matched"])
+    assert report["dry_run"] is False  # mock: подача разрешена
