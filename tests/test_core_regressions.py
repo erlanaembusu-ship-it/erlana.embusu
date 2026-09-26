@@ -1142,3 +1142,36 @@ def test_plan_without_license_guard_has_no_tariff_check(tmp_path, settings) -> N
     assert pipeline.license_guard is None
     plan = pipeline.plan(make_lot(amount=999_999_999.0), food_request(tmp_path))
     assert plan.is_valid
+
+
+def test_ecp_store_profile_roundtrip(tmp_path) -> None:
+    """Режим директора: профиль ЭЦП (алиас+пароль) шифруется и читается."""
+    from core import ecp_store
+
+    path = tmp_path / "ecp_secret.bin"
+    assert ecp_store.load_profile(path) == ("", "")  # файла нет
+
+    ecp_store.save_profile(path, "910103351659", "СекретПароль123")
+    alias, password = ecp_store.load_profile(path)
+    assert alias == "910103351659"
+    assert password == "СекретПароль123"
+
+    # файл не содержит открытого пароля
+    assert "СекретПароль123".encode("utf-8") not in path.read_bytes()
+
+    ecp_store.delete_profile(path)
+    assert ecp_store.load_profile(path) == ("", "")
+
+
+def test_sign_args_include_key_alias_in_director_mode(settings) -> None:
+    """Режим директора: алиас ключа уходит в args.sign (без диалога выбора)."""
+    nca = NCALayerClient(settings.ncalayer)
+    args = nca._build_sign_args(["Zm9v"], "cms", SecretPassword("pw"))
+    assert "keyAlias" not in args  # режим выключен по умолчанию
+
+    tuned = replace(settings.ncalayer, auto_sign=True, key_alias="910103351659")
+    nca2 = NCALayerClient(tuned)
+    args2 = nca2._build_sign_args(["Zm9v"], "cms", SecretPassword("pw"))
+    assert args2["keyAlias"] == "910103351659"
+    # пароль ЭЦП пробрасывается в signerParams (диалог пароля не нужен)
+    assert args2["signerParams"]["password"] == "pw"

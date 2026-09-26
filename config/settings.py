@@ -308,6 +308,11 @@ class NCALayerSettings:
     # прошивки/сборки NCALayer и KAZTOKEN desktop, поддерживающие проброс
     # пароля, а также для автономных тестов на mock-сервере.
     pass_password: bool = True
+    # Режим директора: авто-выбор ключа ЭЦП (диалог выбора не показывается).
+    # Алиас сохраняется в DPAPI-профиле (ui → «ЭЦП директора») и подставляется
+    # в рантайме; env — только для автономной отладки.
+    auto_sign: bool = _env("FASTBID_ECP_AUTO", False)
+    key_alias: str = _env("FASTBID_ECP_KEY_ALIAS", "")
     probe_timeout: float = 0.4
     sign_timeout: float = 120.0  # один документ: пользователь вводит пароль
     sign_batch_timeout: float = 180.0  # пачка документов одним диалогом
@@ -421,6 +426,23 @@ class ProfileSettings:
 # Корневой конфиг
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True, slots=True)
+class EcpSettings:
+    """Режим директора: ЭЦП и пароль сохранены, диалоги NCALayer не нужны.
+
+    Пароль хранится ТОЛЬКО в DPAPI-шифрованном файле пользовательского
+    каталога (расшифровка — тем же пользователем Windows на той же машине),
+    в репозиторий и env не попадает. Включение — осознанное решение:
+    любой, кто получит сессию Windows директора, сможет подписывать.
+    """
+
+    auto_sign: bool = _env("FASTBID_ECP_AUTO", False)
+    # Алиас ключа (ИИН/БИН или отпечаток) для авто-выбора в NCALayer.
+    key_alias: str = _env("FASTBID_ECP_KEY_ALIAS", "")
+    # DPAPI-шифрованный пароль (заполняется из GUI «Настройки»).
+    password_file: Path = DATA_DIR / "ecp_secret.bin"
+
+
+@dataclass(frozen=True, slots=True)
 class AppSettings:
     endpoints: PortalEndpoints = PortalEndpoints()
     timeouts: Timeouts = Timeouts()
@@ -433,6 +455,7 @@ class AppSettings:
     ui: UISettings = UISettings()
     log: LogSettings = LogSettings()
     profile: ProfileSettings = ProfileSettings()
+    ecp: EcpSettings = EcpSettings()
     # token и ecp работают с подтверждённым локальным mock-контрактом.
     # LIVE-вход выполняется на официальном сайте; перенос сессии не реализован.
     auth_mode: str = _env("FASTBID_AUTH_MODE", "token")

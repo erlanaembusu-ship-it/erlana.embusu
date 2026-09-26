@@ -745,7 +745,7 @@ class NCALayerClient:
             # НУЦ РК не документирует поле пароля: сервис, который его не знает,
             # просто проигнорирует лишний ключ. Диалог всё равно один — на пакет.
             signer_params["password"] = password.reveal()
-        return {
+        args: dict[str, Any] = {
             "allowedStorages": list(self.settings.allowed_storages),
             "format": fmt,
             "data": datas,
@@ -753,6 +753,10 @@ class NCALayerClient:
             "signerParams": signer_params,
             "locale": self.settings.locale,
         }
+        # Режим директора: ключ выбирается автоматически (без диалога выбора).
+        if self.settings.auto_sign and self.settings.key_alias:
+            args["keyAlias"] = self.settings.key_alias
+        return args
 
     async def _load_contents(
         self,
