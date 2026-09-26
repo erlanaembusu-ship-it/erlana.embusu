@@ -12,8 +12,13 @@ import math
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 from enum import Enum
 from typing import Any
+
+# Деньги считаем Decimal: float даёт погрешность копейки на суммах лота
+# (например 47 344 048 × 0,5), а цена заявки должна быть точной до тиына.
+_TWO_PLACES = Decimal("0.01")
 
 
 class FieldType(str, Enum):
@@ -148,7 +153,7 @@ class PricingRule:
 
     def suggest(self, lot_amount: float | None) -> float | None:
         if self.strategy == "fixed":
-            return round(self.fixed_amount, 2) or None
+            return float(Decimal(str(self.fixed_amount)).quantize(_TWO_PLACES)) or None
         if (
             self.strategy == "manual"
             or not lot_amount
@@ -158,20 +163,35 @@ class PricingRule:
             return None
         factor = min(max(self.factor, self.min_factor), self.max_factor)
         price = self._round(lot_amount * factor)
-        # Округление к ближайшему шагу могло вывести цену за границы лота —
-        # и она не прошла бы собственную validate().
-        step = self.step or 0.01
-        upper = lot_amount * self.max_factor
-        lower = lot_amount * self.min_factor
-        if price > upper:
-            price = round(math.floor(upper / step + 1e-9) * step, 2)
-        elif price < lower:
-            price = round(math.ceil(lower / step - 1e-9) * step, 2)
+        # Округление к шагу могло вывести цену за границы лота (сумма с
+        # долями копейки: 1000,006 → 1000,01 > лота). Прижимаем к границе
+        # ПО полу сверху и ПО потолку снизу — validate() тогда проходит.
+        step = Decimal(str(self.step or 0.01))
+        raw_upper = lot_amount * self.max_factor
+        raw_lower = lot_amount * self.min_factor
+        if price > raw_upper:
+            price = float(
+                (Decimal(str(raw_upper)) / step).to_integral_value(
+                    rounding=ROUND_DOWN
+                )
+                * step
+            )
+        elif price < raw_lower:
+            price = float(
+                (Decimal(str(raw_lower)) / step).to_integral_value(
+                    rounding=ROUND_HALF_UP
+                )
+                * step
+            )
         return price
 
     def _round(self, value: float) -> float:
         step = self.step or 0.01
-        return round(round(value / step) * step, 2)
+        quant = Decimal(str(step))
+        result = (Decimal(str(value)) / quant).to_integral_value(
+            rounding=ROUND_HALF_UP
+        ) * quant
+        return float(result.quantize(_TWO_PLACES))
 
     def validate(self, price: float, lot_amount: float | None) -> str | None:
         if not math.isfinite(price) or price <= 0:
