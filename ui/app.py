@@ -269,16 +269,20 @@ class Backend:
         """Режим директора: профиль ЭЦП из DPAPI → авто-ключ и пароль сессии."""
         from core.ncalayer_client import SecretPassword
 
-        alias, password = ecp_store.load_profile(self.settings.ecp.password_file)
+        alias, password, key_path = ecp_store.load_profile(
+            self.settings.ecp.password_file
+        )
         if not password:
             return
+        # Файловый ключ: путь подставляется в keyAlias (NCALayer FILE-хранилище).
+        effective_alias = key_path or alias
         self.ncalayer.settings = dataclasses.replace(
-            self.ncalayer.settings, auto_sign=True, key_alias=alias
+            self.ncalayer.settings, auto_sign=True, key_alias=effective_alias
         )
         self.session.set_password(SecretPassword(password))
         self.log.info(
-            "Режим директора: ЭЦП загружена (алиас %s), диалоги подписи отключены",
-            alias or "—",
+            "Режим директора: ЭЦП загружена (%s), диалоги подписи отключены",
+            effective_alias or "—",
         )
 
     # -- автопилот ----------------------------------------------------------- #
@@ -1254,6 +1258,13 @@ class FastBidApp(ctk.CTk):
             text="ЭЦП директора (автоподпись без диалогов)",
             font=ctk.CTkFont(size=13, weight="bold"),
         ).pack(anchor="w", pady=(12, 0))
+        ctk.CTkLabel(
+            frame,
+            text="Первый запуск: укажите файл ключа (.p12/.pfx) и пароль — "
+            "сохранится и будет подставляться автоматически.",
+            text_color=COLORS["dim"],
+            justify="left",
+        ).pack(anchor="w", pady=(0, 4))
         ecp_row = ctk.CTkFrame(frame, fg_color="transparent")
         ecp_row.pack(fill="x", pady=2)
         self._ecp_alias_var = ctk.StringVar(value=self.settings.ecp.key_alias)
@@ -1261,7 +1272,7 @@ class FastBidApp(ctk.CTk):
             ecp_row,
             textvariable=self._ecp_alias_var,
             width=260,
-            placeholder_text="Алиас ключа (ИИН/БИН/отпечаток)",
+            placeholder_text="Алиас ключа (для токен-хранилищ)",
         ).pack(side="left")
         self._ecp_password_var = ctk.StringVar()
         ctk.CTkEntry(
@@ -1284,6 +1295,24 @@ class FastBidApp(ctk.CTk):
             fg_color=COLORS["dim"],
             command=self._on_clear_ecp,
         ).pack(side="left", padx=(8, 0))
+        key_row = ctk.CTkFrame(frame, fg_color="transparent")
+        key_row.pack(fill="x", pady=(4, 0))
+        ctk.CTkLabel(
+            key_row, text="Файл ключа ЭЦП:", font=ctk.CTkFont(size=11)
+        ).pack(side="left")
+        self._ecp_key_path_var = ctk.StringVar()
+        ctk.CTkEntry(
+            key_row,
+            textvariable=self._ecp_key_path_var,
+            width=520,
+            placeholder_text="C:\\ключи\\ГОСТ.p12 — для файлового ключа",
+        ).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(
+            key_row,
+            text="Обзор…",
+            width=90,
+            command=self._on_pick_ecp_key,
+        ).pack(side="left", padx=(6, 0))
         self._ecp_status_label = ctk.CTkLabel(
             frame,
             text=self._ecp_status_text(),
@@ -1347,43 +1376,67 @@ class FastBidApp(ctk.CTk):
     # -- токен OWS и портал ------------------------------------------------- #
     # -- ЭЦП директора (автоподпись) ----------------------------------------- #
     def _ecp_status_text(self) -> str:
-        alias, _password = ecp_store.load_profile(self.settings.ecp.password_file)
-        if alias or _password:
+        alias, _password, key_path = ecp_store.load_profile(
+            self.settings.ecp.password_file
+        )
+        if alias or _password or key_path:
+            what = key_path or alias or "—"
             return (
-                f"ЭЦП директора сохранена (алиас: {alias or '—'}, пароль зашифрован "
-                "DPAPI). Подпись без диалогов; доступ — только у сессии Windows."
+                f"ЭЦП директора сохранена ({what}; пароль зашифрован DPAPI). "
+                "Подпись без диалогов; доступ — только у сессии Windows."
             )
         return (
             "Режим директора выключен: ключ и пароль будут запрашиваться "
-            "NCALayer в диалогах. Сохраните их здесь — и подпись пойдёт "
-            "автоматически (пароль шифруется DPAPI, в репозиторий не попадает)."
+            "NCALayer в диалогах. Укажите файл ключа (.p12) и пароль здесь — "
+            "и подпись пойдёт автоматически (пароль шифруется DPAPI, в "
+            "репозиторий не попадает)."
         )
+
+    def _on_pick_ecp_key(self) -> None:
+        chosen = filedialog.askopenfilename(
+            title="Файл ключа ЭЦП",
+            filetypes=[("Ключ ЭЦП", "*.p12 *.pfx"), ("Все файлы", "*.*")],
+            initialdir=str(self.settings.profile.doc_dir.parent),
+        )
+        if chosen:
+            self._ecp_key_path_var.set(chosen)
 
     def _on_save_ecp(self) -> None:
         alias = self._ecp_alias_var.get().strip()
         password = self._ecp_password_var.get()
+        key_path = self._ecp_key_path_var.get().strip()
         if not password:
             messagebox.showwarning(
                 "ЭЦП директора", "Введите пароль ЭЦП — без него автоподпись не работает."
             )
             return
         try:
-            ecp_store.save_profile(self.settings.ecp.password_file, alias, password)
+            ecp_store.save_profile(
+                self.settings.ecp.password_file, alias, password, key_path
+            )
         except Exception as exc:
             messagebox.showerror("ЭЦП директора", f"Не удалось сохранить: {exc}")
             return
         self._ecp_password_var.set("")
+        # Для файлового ключа NCALayer ожидает путь в keyAlias.
+        effective_alias = key_path or alias
         self.ncalayer.settings = dataclasses.replace(
-            self.ncalayer.settings, auto_sign=True, key_alias=alias
+            self.ncalayer.settings,
+            auto_sign=True,
+            key_alias=effective_alias,
         )
         self.session.set_password(SecretPassword(password))
         self._ecp_status_label.configure(text=self._ecp_status_text())
-        self.log.info("Режим директора: профиль ЭЦП сохранён (алиас %s)", alias or "—")
+        self.log.info(
+            "Режим директора: профиль ЭЦП сохранён (%s)",
+            key_path or alias or "—",
+        )
 
     def _on_clear_ecp(self) -> None:
         ecp_store.delete_profile(self.settings.ecp.password_file)
         self._ecp_alias_var.set("")
         self._ecp_password_var.set("")
+        self._ecp_key_path_var.set("")
         self.ncalayer.settings = dataclasses.replace(
             self.ncalayer.settings, auto_sign=False, key_alias=""
         )

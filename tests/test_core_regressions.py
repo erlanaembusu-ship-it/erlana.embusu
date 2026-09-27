@@ -1170,18 +1170,21 @@ def test_ecp_store_profile_roundtrip(tmp_path) -> None:
     from core import ecp_store
 
     path = tmp_path / "ecp_secret.bin"
-    assert ecp_store.load_profile(path) == ("", "")  # файла нет
+    assert ecp_store.load_profile(path) == ("", "", "")  # файла нет
 
-    ecp_store.save_profile(path, "910103351659", "СекретПароль123")
-    alias, password = ecp_store.load_profile(path)
+    ecp_store.save_profile(
+        path, "910103351659", "СекретПароль123", r"C:\ключи\ГОСТ.p12"
+    )
+    alias, password, key_path = ecp_store.load_profile(path)
     assert alias == "910103351659"
     assert password == "СекретПароль123"
+    assert key_path == r"C:\ключи\ГОСТ.p12"
 
     # файл не содержит открытого пароля
     assert "СекретПароль123".encode("utf-8") not in path.read_bytes()
 
     ecp_store.delete_profile(path)
-    assert ecp_store.load_profile(path) == ("", "")
+    assert ecp_store.load_profile(path) == ("", "", "")
 
 
 def test_sign_args_include_key_alias_in_director_mode(settings) -> None:

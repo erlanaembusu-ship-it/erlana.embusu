@@ -68,12 +68,15 @@ def _dpapi_unprotect(blob: bytes) -> bytes | None:
         ctypes.windll.kernel32.LocalFree(out.pbData)
 
 
-def save_profile(path: Path, alias: str, password: str) -> Path:
-    """Шифрует и сохраняет профиль ЭЦП (алиас ключа + пароль)."""
+def save_profile(
+    path: Path, alias: str, password: str, key_path: str = ""
+) -> Path:
+    """Шифрует и сохраняет профиль ЭЦП (алиас/путь ключа + пароль)."""
     import json
 
     payload = json.dumps(
-        {"alias": alias, "password": password}, ensure_ascii=False
+        {"alias": alias, "password": password, "key_path": key_path},
+        ensure_ascii=False,
     ).encode("utf-8")
     protected = _dpapi_protect(payload)
     if protected is None:
@@ -89,11 +92,11 @@ def save_profile(path: Path, alias: str, password: str) -> Path:
     return path
 
 
-def load_profile(path: Path) -> tuple[str, str]:
-    """Читает профиль ЭЦП. Возвращает (alias, password); пустые — если нет."""
+def load_profile(path: Path) -> tuple[str, str, str]:
+    """Читает профиль ЭЦП. Возвращает (alias, password, key_path)."""
     path = Path(path)
     if not path.exists():
-        return "", ""
+        return "", "", ""
     try:
         blob = base64.b64decode(path.read_bytes())
     except Exception as exc:
@@ -111,8 +114,12 @@ def load_profile(path: Path) -> tuple[str, str]:
         data = json.loads(plain.decode("utf-8"))
     except Exception as exc:
         LOG.error("Профиль ЭЦП: некорректный формат (%s)", exc)
-        return "", ""
-    return str(data.get("alias") or ""), str(data.get("password") or "")
+        return "", "", ""
+    return (
+        str(data.get("alias") or ""),
+        str(data.get("password") or ""),
+        str(data.get("key_path") or ""),
+    )
 
 
 def delete_profile(path: Path) -> None:
