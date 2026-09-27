@@ -1727,25 +1727,27 @@ class FastBidApp(ctk.CTk):
             )
             return
         mode = self._auth_mode()
-        if not self.settings.cabinet_api_verified:
-            # LIVE: вход в кабинет из FastBid не подтверждён — объясняем и
-            # предлагаем официальный вход в браузере, ничего не отправляя.
-            if messagebox.askyesno(
-                "Вход недоступен",
-                f"{LIVE_AUTH_NOTICE}\n\nОткрыть портал в браузере?",
-            ):
-                self._on_open_portal()
-            return
         if mode == "token":
+            # Импорт РЕАЛЬНОЙ сессии портала из браузера: пользователь копирует
+            # Cookie из DevTools — приложение действует от его имени. Подача
+            # при этом остаётся под отдельной защитой (LIVE_SUBMIT_UNVERIFIED).
             dialog = CredentialDialog(self, "token")
             value = dialog.wait_value()
             if not value:
                 return
             self._unlock_button.configure(state="disabled", text="Вход…")
             future = self.bridge.submit(self.backend.apply_token(value))
+        elif not self.settings.cabinet_api_verified:
+            # ЭЦП-вход в LIVE не реализован (SSO zakup.gov.kz — закрытый SPA).
+            if messagebox.askyesno(
+                "Вход по ЭЦП недоступен",
+                f"{LIVE_AUTH_NOTICE}\n\nОткрыть портал в браузере?",
+            ):
+                self._on_open_portal()
+            return
         else:
             # ЭЦП: пароль в GUI не спрашиваем — NCALayer показывает своё окно
-            # выбора ключа и ввода пароля (как на портале).
+            # выбора ключа и ввода пароля.
             self._unlock_button.configure(state="disabled", text="Ожидаю NCALayer…")
             self.log.info("Выберите ключ ЭЦП в окне NCALayer")
             future = self.bridge.submit(self.backend.unlock_and_login())

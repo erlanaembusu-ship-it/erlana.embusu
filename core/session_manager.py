@@ -303,8 +303,13 @@ class SessionManager:
         )
 
     async def apply_manual_token(self, raw_credential: str) -> KeyInfo:
-        """Установить учётные данные только для подтверждённого контракта."""
-        self._require_auth_contract()
+        """Импорт РЕАЛЬНОЙ сессии портала из браузера (Cookie/токен).
+
+        Пользователь авторизуется на портале в браузере и переносит Cookie
+        в приложение — сессия становится сессией портала. Подача заявки
+        остаётся под отдельной защитой (LIVE_SUBMIT_UNVERIFIED) до сверки
+        финального контракта подачи.
+        """
         token, cookie_header = self.parse_credential(raw_credential)
         if not token and not cookie_header:
             raise PortalError(
