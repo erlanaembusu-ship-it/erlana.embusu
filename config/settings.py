@@ -117,8 +117,9 @@ class PortalEndpoints:
 
     # Человекочитаемая карточка объявления (для логов/UI)
     lot_view_path: str = "/ru/announce/index/{trd_buy_id}?tab=lots"
-    # Страница кабинета только для вошедших: проверка импортированной сессии. VERIFY
-    cabinet_check_path: str = _env("FASTBID_CABINET_CHECK_PATH", "/ru/cabinet/profile")
+    # Страница кабинета только для вошедших: проверка импортированной сессии
+    # (сверено по HAR, см. docs/PORTAL_CONTRACT.md).
+    cabinet_check_path: str = _env("FASTBID_CABINET_CHECK_PATH", "/ru/cabinet/permits")
 
     # --- Аутентификация по ЭЦП (VERIFY по трафику кабинета) ---
     auth_challenge_path: str = "/api/auth/challenge"  # VERIFY

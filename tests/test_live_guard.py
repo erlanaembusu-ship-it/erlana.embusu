@@ -164,7 +164,9 @@ def test_live_token_import_checks_cabinet_page(live) -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(request)
-        return httpx.Response(200, text="<html><title>Профиль участника</title></html>")
+        return httpx.Response(
+            200, text='<html><a href="/ru/user/sso_logout">Выход</a></html>'
+        )
 
     async def scenario() -> str:
         session = _session_with_transport(live, handler)
@@ -180,6 +182,24 @@ def test_live_token_import_checks_cabinet_page(live) -> None:
         ("GET", live.endpoints.cabinet_check_path)
     ]
     assert calls[0].headers["cookie"] == "ci_session=abc"
+
+
+def test_live_token_import_rejects_public_page(live) -> None:
+    """200 без формы входа, но и без «Выход» — сессии нет."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html><h1>Объявления</h1></html>")
+
+    async def scenario() -> str:
+        session = _session_with_transport(live, handler)
+        try:
+            with pytest.raises(PortalError) as info:
+                await session.apply_manual_token("ci_session=anon")
+            return info.value.code
+        finally:
+            await session.close()
+
+    assert run(scenario()) == "TOKEN_REJECTED"
 
 
 def test_live_token_import_rejects_login_page(live) -> None:

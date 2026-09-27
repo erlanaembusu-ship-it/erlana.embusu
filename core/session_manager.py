@@ -49,6 +49,11 @@ def is_login_page(final_url: str, html: str) -> bool:
     return "/user/login" in final_url or "Авторизация" in html[:2000]
 
 
+def is_cabinet_page(html: str) -> bool:
+    """Страница вошедшего пользователя: в шапке кабинета есть «Выход» (sso_logout)."""
+    return "/user/sso_logout" in html
+
+
 class PortalError(RuntimeError):
     """Ошибка взаимодействия с порталом (HTTP/бизнес-логика портала)."""
 
@@ -307,9 +312,8 @@ class SessionManager:
             headers={"Accept": "text/html,application/xhtml+xml"},
         )
         final_url = str(getattr(response, "url", target))
-        if response.status_code in (401, 403) or is_login_page(
-            final_url, response.text
-        ):
+        html = response.text
+        if response.status_code in (401, 403) or is_login_page(final_url, html):
             raise PortalError(
                 "Портал вернул страницу входа — сессия не активна",
                 status=401 if response.status_code < 400 else response.status_code,
@@ -319,6 +323,13 @@ class SessionManager:
             raise PortalError(
                 f"Проверка сессии: кабинет ответил HTTP {response.status_code}",
                 status=response.status_code,
+            )
+        if not is_cabinet_page(html):
+            # Публичная страница без формы входа — тоже не сессия.
+            raise PortalError(
+                "Страница кабинета открыта без входа — сессия не активна",
+                status=401,
+                code="NOT_LOGGED_IN",
             )
 
     # -- токен публичного реестра OWS ---------------------------------------- #
