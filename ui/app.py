@@ -74,6 +74,7 @@ class AsyncBridge:
     def __init__(self, logger: logging.Logger | None = None) -> None:
         self.log = logger or get_logger("bridge")
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._login_cancelled = False
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
 
@@ -208,6 +209,7 @@ class Backend:
         self._pipeline_totals = {"planned": 0, "warmed": 0, "submitted": 0, "failed": 0}
         self._license_status: LicenseStatus | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._login_cancelled = False
         # Способ входа: token (мост из браузера) | ecp (NCALayer).
         # LIVE → token по умолчанию, mock → ecp.
         self.auth_mode: str = "ecp" if settings.mode == "mock" else settings.auth_mode
@@ -459,24 +461,36 @@ class Backend:
         self.watcher.settings = updated
         return updated
 
-    async def webview_login(self) -> dict[str, Any]:
-        """Вход через встроенный браузер: окно портала → захват сессии.
+    async def browser_login(self) -> dict[str, Any]:
+        """Вход через отдельное окно Edge/Chrome: захват сессии по CDP.
 
-        Пользователь входит по ЭЦП как обычно (SSO, NCALayer спросит
-        ключ/пароль). Приложение само перехватывает сессионную Cookie —
-        DevTools и ручное копирование не нужны.
+        Пользователь входит на портал в открывшемся окне (SSO ЭЦП, NCALayer
+        спросит ключ/пароль). Приложение читает cookies окна и проверяет
+        их запросом к странице кабинета — DevTools не нужны.
         """
-        from core.webview_login import capture_portal_session
+        from core.browser_login import capture_via_browser
 
-        login_url = self.settings.endpoints.cabinet_base.rstrip("/") + "/ru/user/login"
+        def cancelled() -> bool:
+            return self._login_cancelled
+
+        self._login_cancelled = False
         cookie = await asyncio.to_thread(
-            capture_portal_session, login_url
+            capture_via_browser,
+            self.settings.endpoints.cabinet_base.rstrip("/")
+            + "/ru/user/login",
+            cookie_host="v3bl.goszakup.gov.kz",
+            check_url=self.settings.endpoints.cabinet_base.rstrip("/")
+            + "/ru/cabinet/profile",
+            timeout_s=900.0,
+            cancel=cancelled,
+            log=self.log,
         )
         if not cookie:
             raise PortalError(
-                "Окно входа закрыто без авторизации",
-                code="WEBVIEW_CANCELLED",
+                "Вход в окне браузера не выполнен (отмена или таймаут)",
+                code="BROWSER_LOGIN_CANCELLED",
             )
+        ecp_store.save_secret(self.settings.ecp.session_file, cookie)
         key_info = await self.session.apply_manual_token(cookie)
         self.refresh_license()
         return {"key_info": key_info, "license_warning": ""}
@@ -1782,12 +1796,13 @@ class FastBidApp(ctk.CTk):
             self._unlock_button.configure(state="disabled", text="Вход…")
             future = self.bridge.submit(self.backend.apply_token(value))
         elif not self.settings.cabinet_api_verified:
-            # ЭЦП-вход в LIVE через встроенный браузер: окно портала внутри
-            # приложения — пользователь входит как обычно, приложение
-            # захватывает сессионную Cookie автоматически.
-            self._unlock_button.configure(state="disabled", text="Открываю окно входа…")
-            self.log.info("Открываю встроенный вход на портал (режим директора)")
-            future = self.bridge.submit(self.backend.webview_login())
+            # ЭЦП-вход в LIVE: отдельное окно Edge/Chrome со своим профилем —
+            # пользователь входит как обычно, приложение захватывает сессию
+            # по CDP (cookie httpOnly, вручную копировать не нужно).
+            self._unlock_button.configure(state="disabled", text="Открываю браузер входа…")
+            self._auth_mode_menu.configure(state="disabled")
+            self.log.info("Открываю окно входа на портал (режим директора)")
+            future = self.bridge.submit(self.backend.browser_login())
         else:
             # ЭЦП: пароль в GUI не спрашиваем — NCALayer показывает своё окно
             # выбора ключа и ввода пароля.
