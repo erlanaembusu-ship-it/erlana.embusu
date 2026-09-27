@@ -35,6 +35,7 @@ from config.niche_blueprints import BLUEPRINTS, DocKind, resolve_blueprint
 from config.settings import (
     APP_NAME,
     APP_VERSION,
+    LIVE_DRAFT_NOTICE,
     LIVE_SUBMIT_NOTICE,
     OWS_TOKEN_NOTICE,
     PORTAL_LOGIN_URL,
@@ -201,6 +202,8 @@ class Backend:
         self.log = logger or get_logger("backend")
         self.ncalayer = NCALayerClient(settings.ncalayer)
         self.session = SessionManager(settings, self.ncalayer)
+        # Ротация ci_session порталом → DPAPI-снимок сессии всегда актуален.
+        self.session.persist_hook = self._persist_session_cookie
         self.license = LicenseGuard(settings)
         self.watcher = LotWatcher(self.session, settings)
         self.pipeline = BidPipeline(
@@ -259,6 +262,14 @@ class Backend:
         return status
 
     # -- ЭЦП и сессия ------------------------------------------------------- #
+    def _persist_session_cookie(self, cookie_header: str, user_agent: str) -> None:
+        """Ротация ci_session: обновляем DPAPI-снимок сессии портала."""
+        payload: dict[str, str] = {"cookie": cookie_header}
+        if user_agent:
+            payload["user_agent"] = user_agent
+        ecp_store.save_secret(self.settings.ecp.session_file, json.dumps(payload))
+        self.log.debug("Снимок сессии портала обновлён после ротации")
+
     def set_password(self, password: SecretPassword | None) -> None:
         self.session.set_password(password)
         self.events.put("password", locked=password is not None)
@@ -558,6 +569,8 @@ class Backend:
         """Взвод подачи черновика, подготовленного в браузере (см. core.draft_submit)."""
         if self._loop is None:
             raise RuntimeError("Backend не привязан к event loop")
+        if real and not self.settings.cabinet_pages_verified:
+            raise ValueError(LIVE_SUBMIT_NOTICE)
         if self._draft_future is not None and not self._draft_future.done():
             raise ValueError("Подача черновика уже взведена — сначала снимите её")
         if not self.session.is_online:
@@ -1081,7 +1094,7 @@ class FastBidApp(ctk.CTk):
             tab,
             text="MOCK: локальная проверка без реальных закупок"
             if self.settings.mode == "mock"
-            else f"LIVE: {LIVE_SUBMIT_NOTICE}",
+            else LIVE_DRAFT_NOTICE,
             text_color=COLORS["dim"],
             font=ctk.CTkFont(size=11),
             wraplength=1100,

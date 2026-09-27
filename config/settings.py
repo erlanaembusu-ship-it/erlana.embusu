@@ -50,6 +50,18 @@ LIVE_SUBMIT_NOTICE: Final[str] = (
     "LIVE-подача заблокирована: адреса и формат подачи кабинета не подтверждены. "
     "Доступны локальная проверка (--mock) и DRY-RUN без подписи и загрузок."
 )
+LIVE_DRAFT_NOTICE: Final[str] = (
+    "LIVE: подача подготовленной заявки разрешена — контракт кабинета "
+    "(предпросмотр, csrf, ajax_public_application, налоговые сведения) сверен "
+    "по HAR реальной подачи. Старый конвейер /api/bid/* работает только в --mock."
+)
+
+# Контракт кабинета v3bl для подачи подготовленной заявки (страницы и
+# ajax_*-действия) сверен по HAR реальной подачи — docs/PORTAL_CONTRACT.md
+# (27.09.2026). Разрешает LIVE-подачу черновика (core/draft_submit.py).
+# Старые пути /api/bid/*, /api/session/ping на портале не существуют — они
+# остаются mock-only (cabinet_api_verified). Значение меняется только здесь.
+CABINET_PAGES_CONTRACT_VERIFIED: Final[bool] = True
 
 # Приём заявок на портале открывается в TrdBuy.startDate. Это и есть T0.
 T0_SOURCE_FIELD: Final[str] = "TrdBuy.startDate"
@@ -517,17 +529,27 @@ class AppSettings:
 
     @property
     def cabinet_api_verified(self) -> bool:
-        """Подтверждён ли контракт API кабинета (вход, ping, загрузка, submit).
+        """Подтверждён ли старый контракт API кабинета (ping, /api/bid/*).
 
-        Сейчас подтверждён только локальный mock-контракт. Когда пути кабинета
-        будут сверены по HAR-записи реального трафика, условие меняется ЗДЕСЬ
-        (и только здесь) — остальной код опирается на это свойство.
+        Эти пути на реальном портале НЕ существуют (см. docs/PORTAL_CONTRACT.md,
+        раздел «Расхождения»), поэтому подтвержён только локальный mock-контракт:
+        старый конвейер и ping-механика сессии в LIVE остаются выключенными.
         """
         return self.uses_local_mock
 
     @property
+    def cabinet_pages_verified(self) -> bool:
+        """Контракт подачи подготовленной заявки (страницы/ajax_* v3bl).
+
+        Сверен по HAR реальной подачи — docs/PORTAL_CONTRACT.md; разрешает
+        LIVE-подачу черновика (core/draft_submit.py). Переключается константой
+        CABINET_PAGES_CONTRACT_VERIFIED выше и только ею.
+        """
+        return self.uses_local_mock or CABINET_PAGES_CONTRACT_VERIFIED
+
+    @property
     def live_submit_allowed(self) -> bool:
-        """Разрешена ли реальная подпись/загрузка/подача (не DRY-RUN)."""
+        """Разрешена ли реальная подпись/загрузка/подача старым конвейером."""
         return self.cabinet_api_verified
 
     # -- производные пути -------------------------------------------------- #
@@ -589,6 +611,7 @@ class AppSettings:
             "price_factor": self.pipeline.price_factor_default,
             "dry_run": self.dry_run,
             "cabinet_api_verified": self.cabinet_api_verified,
+            "cabinet_pages_verified": self.cabinet_pages_verified,
             "live_submit_allowed": self.live_submit_allowed,
             "data_dir": str(DATA_DIR),
         }

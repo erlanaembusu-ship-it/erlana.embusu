@@ -21,8 +21,9 @@ ANNO, APP = 17666784, 73161291
 LOGOUT = '<a href="/ru/user/sso_logout">Выход</a>'
 PREVIEW = (
     f'<html><meta name="csrf-token-hash" content="tok123">{LOGOUT}'
-    '<button id="next">Подать заявку</button>'
-    '<button id="btn_price_agree_no_captcha">Да</button></html>'
+    "<script>$.post('/ru/application/ajax_public_application/17666784/73161291'"
+    ", send_application())</script>"
+    '<button id="next">Подать заявку</button></html>'
 )
 
 
@@ -137,10 +138,27 @@ def test_tax_debt_error_is_not_retried() -> None:
 
 
 def test_captcha_blocks_arming() -> None:
-    portal = FakePortal([], preview=PREVIEW.replace("_no_captcha", ""))
+    portal = FakePortal(
+        [], preview=PREVIEW.replace("</html>", '<div data-sitekey="rc"></div></html>')
+    )
     with pytest.raises(PortalError) as info:
         run_draft(portal, dry_run=False)
     assert info.value.code == "CAPTCHA_REQUIRED"
+    assert portal.posts() == []
+
+
+def test_intermediate_step_is_not_preview() -> None:
+    """Шаг «Документы» (live-проба 26.09.2026): csrf и кнопка «Далее» есть,
+    действия подачи нет — взвод отклоняется, POST не отправляется."""
+    docs_step = (
+        f'<html><meta name="csrf-token-hash" content="tok123">{LOGOUT}'
+        '<form action="/ru/application/docs/17666784/73161291" id="docs">'
+        '<button id="next">Далее</button></form></html>'
+    )
+    portal = FakePortal([], preview=docs_step)
+    with pytest.raises(PortalError) as info:
+        run_draft(portal, dry_run=False)
+    assert info.value.code == "DRAFT_NOT_READY"
     assert portal.posts() == []
 
 

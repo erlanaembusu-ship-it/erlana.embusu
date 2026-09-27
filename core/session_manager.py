@@ -23,6 +23,7 @@ import logging
 import random
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -181,6 +182,12 @@ class SessionManager:
         self._t0_monotonic: float | None = None
         self._keepalive_failures = 0
         self._session_started = time.monotonic()
+        # Ротация ci_session: портал выдаёт новый cookie при использовании
+        # сессии. Hook (DPAPI из Backend) сохраняет актуальный cookie, иначе
+        # снимок в хранилище устаревает за минуты и «перезапуск» теряет сессию.
+        self.persist_hook: Callable[[str, str], None] | None = None
+        self._persisted_cookie: str = ""
+        self._portal_user_agent: str = ""
 
     # -- состояние ---------------------------------------------------------- #
     @property
@@ -332,6 +339,31 @@ class SessionManager:
                 status=401,
                 code="NOT_LOGGED_IN",
             )
+        self._persist_rotated()
+
+    def _persist_rotated(self) -> None:
+        """Портал ротирует ci_session — отдаём актуальный cookie в persist_hook.
+
+        Без этого DPAPI-снимок, сделанный при входе, устаревает за минуты:
+        после перезапуска приложение получает уже отозванный cookie.
+        """
+        if self.persist_hook is None or self._client is None:
+            return
+        pairs = [
+            f"{cookie.name}={cookie.value}"
+            for cookie in self.client.cookies.jar
+            if "goszakup.gov.kz" in (cookie.domain or "")
+        ]
+        if not pairs:
+            return
+        cookie_header = "; ".join(pairs)
+        if cookie_header == self._persisted_cookie:
+            return
+        self._persisted_cookie = cookie_header
+        try:
+            self.persist_hook(cookie_header, self._portal_user_agent)
+        except Exception as exc:  # сбой сохранения не должен ронять сессию
+            self.log.warning("Ротацию сессии не удалось сохранить: %s", exc)
 
     # -- токен публичного реестра OWS ---------------------------------------- #
     def ows_headers(self) -> dict[str, str]:
@@ -401,6 +433,7 @@ class SessionManager:
             self.client.headers["Authorization"] = f"Bearer {token}"
         if user_agent:
             self.client.headers["User-Agent"] = user_agent
+            self._portal_user_agent = user_agent
         self.token_only = True
         self._keepalive_failures = 0
 

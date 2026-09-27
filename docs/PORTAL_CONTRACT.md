@@ -80,5 +80,7 @@ TumarCSP: `SYSAPI.SetAPIKey` (`apiKey` = `hsm_api_key` из inline-скрипт�
 
 Реализовано по этому протоколу: `core/draft_submit.py` (подача черновика в T0,
 налоговые сведения, проверка капчи) и keep-alive сессии страницей кабинета.
-Старый конвейер (`core/bid_pipeline.py`, `/api/bid/...`) в LIVE по-прежнему
-заблокирован.
+**LIVE-подача подготовленной заявки разрешена** — контракт подтверждён
+константой `CABINET_PAGES_CONTRACT_VERIFIED` в `config/settings.py` (менять
+только там). Старый конвейер (`core/bid_pipeline.py`, `/api/bid/...`) в LIVE
+по-прежнему заблокирован: этих путей на портале не существует.

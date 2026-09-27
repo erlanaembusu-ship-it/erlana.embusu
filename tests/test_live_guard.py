@@ -27,6 +27,7 @@ if str(ROOT) not in sys.path:
 
 from config.settings import load_settings
 from core.bid_pipeline import BidPipeline
+from core.draft_submit import DraftRef, DraftSubmitter
 from core.lot_watcher import LotState, LotWatcher
 from core.ncalayer_client import NCALayerClient, NCALayerError
 from core.session_manager import PortalError, SessionManager
@@ -405,3 +406,137 @@ def test_pasted_cookie_string_sends_no_bearer(live) -> None:
     run(scenario())
     assert "authorization" not in seen[0].headers
     assert seen[0].headers["cookie"] == "ci_session=abc"
+
+
+def test_cookie_rotation_persists_to_hook(live) -> None:
+    """Портал ротирует ci_session — hook получает актуальный cookie, а не
+    снимок на момент входа (иначе DPAPI-сессия умирает за минуты)."""
+    saved: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.headers["cookie"].endswith("abc"):
+            return httpx.Response(
+                200,
+                text='<a href="/ru/user/sso_logout">Выход</a>',
+                headers={"Set-Cookie": "ci_session=rotated; Path=/; HttpOnly"},
+            )
+        return httpx.Response(200, text='<a href="/ru/user/sso_logout">Выход</a>')
+
+    async def scenario() -> None:
+        session = _session_with_transport(live, handler)
+        session.persist_hook = lambda cookie, ua: saved.append((cookie, ua))
+        try:
+            await session.apply_manual_token(
+                "ci_session=abc", user_agent="Mozilla/5.0 Edg/140.0"
+            )
+            await session.check_cabinet_page()
+        finally:
+            await session.close()
+
+    run(scenario())
+    assert saved == [("ci_session=rotated", "Mozilla/5.0 Edg/140.0")]
+
+
+# --------------------------------------------------------------------------- #
+# Подача подготовленной заявки: контракт сверен по HAR — в LIVE разрешена
+# --------------------------------------------------------------------------- #
+_PREVIEW_HTML = (
+    "<!doctype html><html><head>"
+    '<meta name="csrf-token-hash" content="csrf-token">'
+    "</head><body>"
+    '<a href="/ru/user/sso_logout">Выход</a>'
+    "<script>$.post('/ru/application/ajax_public_application/17630537/73154497')"
+    "</script>"
+    '<form id="sign_files"><input id="next" value="Подать заявку"></form>'
+    "</body></html>"
+)
+
+
+def test_live_draft_contract_flags(live) -> None:
+    """Подача черновика разрешена (контракт по HAR), старый /api/bid — нет."""
+    assert live.cabinet_pages_verified is True
+    assert live.cabinet_api_verified is False
+    assert live.live_submit_allowed is False
+
+
+def test_live_draft_real_submit_reaches_portal(live) -> None:
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if "ajax_public_application" in request.url.path:
+            return httpx.Response(200, json={"status": "ok", "debtor": 0})
+        return httpx.Response(200, text=_PREVIEW_HTML)
+
+    async def scenario() -> Any:
+        session = _session_with_transport(live, handler)
+        try:
+            submitter = DraftSubmitter(session, live)
+            return await submitter.run(
+                DraftRef(17630537, 73154497),
+                dry_run=False,
+                t0_epoch=time.time() - 1.0,
+                request_tax=False,
+            )
+        finally:
+            await session.close()
+
+    result = run(scenario())
+    assert result.ok, result.message
+    assert result.responses[-1] == {"status": "ok", "debtor": 0}
+    submits = [c for c in calls if "ajax_public_application" in str(c.url)]
+    assert len(submits) == 1
+    assert "csrf=csrf-token" in submits[0].read().decode()
+
+
+def test_live_draft_real_submit_blocked_when_unverified(live, monkeypatch) -> None:
+    """Ядро не подаёт заявку, даже если контракт не подтверждён (независимо от UI)."""
+    monkeypatch.setattr("config.settings.CABINET_PAGES_CONTRACT_VERIFIED", False)
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, text=_PREVIEW_HTML)
+
+    async def scenario() -> PortalError:
+        session = _session_with_transport(live, handler)
+        try:
+            submitter = DraftSubmitter(session, live)
+            with pytest.raises(PortalError) as info:
+                await submitter.run(
+                    DraftRef(17630537, 73154497),
+                    dry_run=False,
+                    t0_epoch=time.time() - 1.0,
+                )
+            return info.value
+        finally:
+            await session.close()
+
+    error = run(scenario())
+    assert error.code == "LIVE_SUBMIT_UNVERIFIED"
+    assert calls == []
+
+
+def test_live_draft_dry_run_never_submits(live) -> None:
+    """DRY-RUN доходит до T0, но POST «Подать» не отправляется."""
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, text=_PREVIEW_HTML)
+
+    async def scenario() -> Any:
+        session = _session_with_transport(live, handler)
+        try:
+            submitter = DraftSubmitter(session, live)
+            return await submitter.run(
+                DraftRef(17630537, 73154497),
+                dry_run=True,
+                t0_epoch=time.time() - 1.0,
+            )
+        finally:
+            await session.close()
+
+    result = run(scenario())
+    assert result.ok and result.dry_run
+    assert not any("ajax_public_application" in str(c.url) for c in calls)

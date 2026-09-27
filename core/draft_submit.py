@@ -89,10 +89,13 @@ def extract_csrf(html: str) -> str:
 
 
 def captcha_required(preview_html: str) -> bool:
-    """Предпросмотр требует капчу (в варианте без неё кнопка «Да» — *_no_captcha)."""
-    if "g-recaptcha" in preview_html or "data-sitekey" in preview_html:
-        return True
-    return "btn_price_agree_no_captcha" not in preview_html
+    """Принудительная капча на предпросмотре.
+
+    Скрипт reCAPTCHA сам по себе не признак: по HAR он есть и в успешной
+    подаче без капчи. Признак — виджет/поле ответа капчи (data-sitekey,
+    элемент g-recaptcha, поле g-recaptcha-response).
+    """
+    return "data-sitekey" in preview_html or "g-recaptcha" in preview_html
 
 
 class DraftSubmitter:
@@ -190,10 +193,14 @@ class DraftSubmitter:
                 "проверьте адрес и что заявка доведена до «Предварительного просмотра»",
                 code="DRAFT_NOT_READY",
             )
-        if 'id="next"' not in html:
+        if "ajax_public_application" not in html:
+            # Промежуточные шаги (документы, цены) тоже содержат кнопку
+            # «Далее» (id="next") и csrf — проверяем именно действие подачи,
+            # которое есть только на финальном предпросмотре (HAR + live-проба
+            # от 26.09.2026: шаг «Документы» заявки 73154497 не содержит его).
             raise PortalError(
-                f"Заявка {ref}: на предпросмотре нет кнопки «Подать заявку» — "
-                "заявка уже подана или не заполнена до конца",
+                f"Заявка {ref}: это ещё не «Предварительный просмотр» — доведите "
+                "заявку в браузере до предпросмотра (документы, цены, подписи)",
                 code="DRAFT_NOT_READY",
             )
         if captcha_required(html):
@@ -291,6 +298,13 @@ class DraftSubmitter:
 
         pipe = self.settings.pipeline
         result = DraftResult(ok=False, dry_run=dry_run, ref=ref)
+        if not dry_run and not self.settings.cabinet_pages_verified:
+            # Ядро не отправляет заявку, пока контракт подачи не подтверждён —
+            # независимо от UI (см. test_live_guard.py).
+            raise PortalError(
+                "LIVE-подача заблокирована: контракт подачи кабинета не подтверждён",
+                code="LIVE_SUBMIT_UNVERIFIED",
+            )
         stage("prepare")
         await self.sync_clock()
         await self.prepare(ref)
