@@ -34,7 +34,6 @@ from config.niche_blueprints import BLUEPRINTS, DocKind, resolve_blueprint
 from config.settings import (
     APP_NAME,
     APP_VERSION,
-    LIVE_AUTH_NOTICE,
     LIVE_SUBMIT_NOTICE,
     OWS_TOKEN_NOTICE,
     PORTAL_LOGIN_URL,
@@ -459,6 +458,28 @@ class Backend:
         self.pipeline.settings = updated
         self.watcher.settings = updated
         return updated
+
+    async def webview_login(self) -> dict[str, Any]:
+        """Вход через встроенный браузер: окно портала → захват сессии.
+
+        Пользователь входит по ЭЦП как обычно (SSO, NCALayer спросит
+        ключ/пароль). Приложение само перехватывает сессионную Cookie —
+        DevTools и ручное копирование не нужны.
+        """
+        from core.webview_login import capture_portal_session
+
+        login_url = self.settings.endpoints.cabinet_base.rstrip("/") + "/ru/user/login"
+        cookie = await asyncio.to_thread(
+            capture_portal_session, login_url
+        )
+        if not cookie:
+            raise PortalError(
+                "Окно входа закрыто без авторизации",
+                code="WEBVIEW_CANCELLED",
+            )
+        key_info = await self.session.apply_manual_token(cookie)
+        self.refresh_license()
+        return {"key_info": key_info, "license_warning": ""}
 
     async def unlock_and_login(self, password_value: str = "") -> dict[str, Any]:
         """Вход по ЭЦП: challenge → подпись NCALayer → сессия портала.
@@ -1761,13 +1782,12 @@ class FastBidApp(ctk.CTk):
             self._unlock_button.configure(state="disabled", text="Вход…")
             future = self.bridge.submit(self.backend.apply_token(value))
         elif not self.settings.cabinet_api_verified:
-            # ЭЦП-вход в LIVE не реализован (SSO zakup.gov.kz — закрытый SPA).
-            if messagebox.askyesno(
-                "Вход по ЭЦП недоступен",
-                f"{LIVE_AUTH_NOTICE}\n\nОткрыть портал в браузере?",
-            ):
-                self._on_open_portal()
-            return
+            # ЭЦП-вход в LIVE через встроенный браузер: окно портала внутри
+            # приложения — пользователь входит как обычно, приложение
+            # захватывает сессионную Cookie автоматически.
+            self._unlock_button.configure(state="disabled", text="Открываю окно входа…")
+            self.log.info("Открываю встроенный вход на портал (режим директора)")
+            future = self.bridge.submit(self.backend.webview_login())
         else:
             # ЭЦП: пароль в GUI не спрашиваем — NCALayer показывает своё окно
             # выбора ключа и ввода пароля.
