@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from config.settings import PortalSettings
+from config.settings import WatcherSettings
 from core.lot_watcher import LotState
 
 _LABEL_RE = r'([^<>"]{4,70}?)\s*</(?:th|td|label|span|b|strong)>'
@@ -73,13 +73,14 @@ def parse_lots_tab(html: str) -> list[dict[str, Any]]:
                 "amount_text": (amount_m.group(1).replace(" ", "") if amount_m else ""),
             }
         )
-    return lots
+    # Ложные срабатывания (номер объявления без данных лота) — вон.
+    return [lot for lot in lots if lot["name"] and lot["amount_text"]]
 
 
 def lot_state_from_announce(
     anno: dict[str, Any],
     lot: dict[str, Any],
-    settings: PortalSettings,
+    settings: WatcherSettings,
 ) -> LotState:
     """Собирает LotState из разобранной страницы объявления."""
     from core.lot_watcher import parse_portal_datetime
