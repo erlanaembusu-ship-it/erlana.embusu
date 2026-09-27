@@ -188,12 +188,25 @@ Windows** (расшифровка только тем же пользовате�
 |---|---|
 | Настройки | `AppSettings.cabinet_api_verified` / `live_submit_allowed` = `False` вне локального mock |
 | Ядро | `BidPipeline._live_guard` в `warmup`/`submit`, стоп в `run_cycle` до подписи и наблюдения (`LIVE_SUBMIT_UNVERIFIED`) — независимо от UI |
-| Сессия | вход по токену/ЭЦП, ping, keep-alive и relogin кабинета отключены (`LIVE_AUTH_UNVERIFIED`) |
-| UI | DRY-RUN принудительно включён и не снимается; кнопка входа объясняет блокировку и предлагает открыть портал в браузере |
+| Сессия | прямой ЭЦП-вход в API, ping, keep-alive и relogin кабинета отключены (`LIVE_AUTH_UNVERIFIED`); сессия берётся из браузера и проверяется GET-запросом страницы кабинета |
+| UI | DRY-RUN принудительно включён и не снимается |
 
-Вход в браузере **не** авторизует FastBid автоматически. Кнопка «Открыть
-портал в браузере» ведёт на официальный вход поставщика
-(`https://v3bl.goszakup.gov.kz/ru/user/sso_redirect`, ЭЦП/QR — как всегда).
+### Вход в LIVE
+
+* **«Войти по ЭЦП»** — FastBid открывает Edge/Chrome/Chromium с **отдельным
+  профилем** (`%APPDATA%\FastBidGosZakup\browser_profile`) на официальном
+  входе (`https://v3bl.goszakup.gov.kz/ru/user/sso_redirect`). Входите по
+  ЭЦП/NCALayer как обычно — после входа FastBid сам забирает Cookie кабинета
+  через DevTools-протокол (только `127.0.0.1`), проверяет их страницей
+  кабинета и сохраняет DPAPI. «Заблокировать» во время ожидания отменяет вход.
+  Путь к браузеру можно задать `FASTBID_BROWSER`, таймаут —
+  `FASTBID_BROWSER_LOGIN_TIMEOUT` (по умолчанию 600 с). Выход из кабинета в
+  этом окне браузера завершает и сессию FastBid (Cookie общие).
+* **«Войти по токену»** — ручная вставка Cookie из DevTools любого браузера.
+  Проверочная страница — `FASTBID_CABINET_CHECK_PATH` (по умолчанию
+  `/ru/cabinet/profile`, `VERIFY`).
+* Кнопка «Открыть портал в браузере» просто открывает портал в браузере по
+  умолчанию — такой вход FastBid **не** видит.
 
 **Единственная точка разблокировки** — свойство
 `AppSettings.cabinet_api_verified` в `config/settings.py`. Менять его можно

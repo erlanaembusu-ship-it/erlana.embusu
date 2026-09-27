@@ -44,6 +44,11 @@ from utils.logger import BUS, Stopwatch, get_logger
 __all__ = ["PortalError", "SessionManager", "SessionState", "SessionStats"]
 
 
+def is_login_page(final_url: str, html: str) -> bool:
+    """Портал вместо запрошенной страницы кабинета отдал форму входа."""
+    return "/user/login" in final_url or "Авторизация" in html[:2000]
+
+
 class PortalError(RuntimeError):
     """Ошибка взаимодействия с порталом (HTTP/бизнес-логика портала)."""
 
@@ -284,6 +289,38 @@ class SessionManager:
             self.clear_credentials()
             raise PortalError(LIVE_AUTH_NOTICE, code="LIVE_AUTH_UNVERIFIED")
 
+    async def check_cabinet_page(
+        self, url: str = "", timeout: float | None = None
+    ) -> None:
+        """Проверка сессии в LIVE: страница кабинета, а не форма входа.
+
+        API кабинета (ping) не подтверждён, поэтому живость сессии проверяется
+        тем же способом, что и чтение лотов со страниц v3bl.
+        """
+        endpoints = self.settings.endpoints
+        target = url or endpoints.cabinet_url(endpoints.cabinet_check_path)
+        response = await self.request(
+            "GET",
+            target,
+            allow_relogin=False,
+            timeout=timeout or self.settings.timeouts.read,
+            headers={"Accept": "text/html,application/xhtml+xml"},
+        )
+        final_url = str(getattr(response, "url", target))
+        if response.status_code in (401, 403) or is_login_page(
+            final_url, response.text
+        ):
+            raise PortalError(
+                "Портал вернул страницу входа — сессия не активна",
+                status=401 if response.status_code < 400 else response.status_code,
+                code="LOGIN_PAGE",
+            )
+        if response.status_code >= 400:
+            raise PortalError(
+                f"Проверка сессии: кабинет ответил HTTP {response.status_code}",
+                status=response.status_code,
+            )
+
     # -- токен публичного реестра OWS ---------------------------------------- #
     def ows_headers(self) -> dict[str, str]:
         """Заголовки для запросов к реестру OWS.
@@ -302,13 +339,18 @@ class SessionManager:
             code="OWS_UNAUTHORIZED",
         )
 
-    async def apply_manual_token(self, raw_credential: str) -> KeyInfo:
+    async def apply_manual_token(
+        self, raw_credential: str, check_url: str = ""
+    ) -> KeyInfo:
         """Импорт РЕАЛЬНОЙ сессии портала из браузера (Cookie/токен).
 
         Пользователь авторизуется на портале в браузере и переносит Cookie
         в приложение — сессия становится сессией портала. Подача заявки
         остаётся под отдельной защитой (LIVE_SUBMIT_UNVERIFIED) до сверки
         финального контракта подачи.
+
+        ``check_url`` — страница кабинета для проверки сессии в LIVE (по
+        умолчанию ``cabinet_check_path``).
         """
         token, cookie_header = self.parse_credential(raw_credential)
         if not token and not cookie_header:
@@ -330,9 +372,11 @@ class SessionManager:
         self._keepalive_failures = 0
 
         try:
-            await self.ping(
-                timeout=min(self.settings.timeouts.read, 8.0), allow_relogin=False
-            )
+            timeout = min(self.settings.timeouts.read, 8.0)
+            if self.settings.cabinet_api_verified:
+                await self.ping(timeout=timeout, allow_relogin=False)
+            else:
+                await self.check_cabinet_page(check_url, timeout=timeout)
         except PortalError as exc:
             self.clear_credentials()
             if exc.status not in (401, 403):

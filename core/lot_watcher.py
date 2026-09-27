@@ -33,7 +33,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from config.settings import AppSettings
-from core.session_manager import PortalError, SessionManager
+from core.session_manager import PortalError, SessionManager, is_login_page
 from utils.logger import BUS, get_logger
 
 __all__ = ["LOT_QUERY", "ClockSync", "LotState", "LotWatcher", "parse_portal_datetime"]
@@ -545,10 +545,10 @@ class LotWatcher:
             )
             html = response.text
             final_url = str(getattr(response, "url", url))
-            if "/user/login" in final_url or "Авторизация" in html[:2000]:
+            if is_login_page(final_url, html):
                 raise PortalError(
                     "Сессия портала истекла — войдите на портал и импортируйте "
-                    "Cookie заново («Войти по токену»)",
+                    "сессию заново («Войти по ЭЦП» или «Войти по токену»)",
                     code="PORTAL_SESSION_EXPIRED",
                 )
             return html, final_url

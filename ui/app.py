@@ -27,6 +27,7 @@ from collections.abc import Callable
 from pathlib import Path
 from tkinter import filedialog, messagebox
 from typing import Any
+from urllib.parse import urlsplit
 
 import customtkinter as ctk
 
@@ -34,7 +35,6 @@ from config.niche_blueprints import BLUEPRINTS, DocKind, resolve_blueprint
 from config.settings import (
     APP_NAME,
     APP_VERSION,
-    LIVE_AUTH_NOTICE,
     LIVE_SUBMIT_NOTICE,
     OWS_TOKEN_NOTICE,
     PORTAL_LOGIN_URL,
@@ -42,6 +42,7 @@ from config.settings import (
     ProfileSettings,
 )
 from core.bid_pipeline import BidPipeline, BidRequest, BidResult
+from core.browser_login import BrowserLoginError, capture_portal_session, find_browser
 from core.license_guard import LicenseGuard, LicenseStatus
 from core import ecp_store
 from core.lot_watcher import LotState, LotWatcher
@@ -263,6 +264,41 @@ class Backend:
         self.refresh_license()
         return {"key_info": key_info, "license_warning": ""}
 
+    async def browser_login(self) -> dict[str, Any]:
+        """«Войти по ЭЦП» в LIVE: вход в окне браузера → Cookie кабинета.
+
+        Пользователь входит на портале по ЭЦП (NCALayer) в браузере, который
+        открыл FastBid; сессия подхватывается автоматически, как при вставке
+        Cookie вручную.
+        """
+        ecp = self.settings.ecp
+        cabinet_host = urlsplit(self.settings.endpoints.cabinet_base).hostname or ""
+
+        async def validate(cookie_header: str, page_url: str) -> dict[str, Any] | None:
+            try:
+                key_info = await self.session.apply_manual_token(
+                    cookie_header, check_url=page_url
+                )
+            except PortalError as exc:
+                # Вход в браузере ещё не завершён или портал временно недоступен.
+                self.log.debug("Сессия из браузера пока не принята: %s", exc)
+                return None
+            ecp_store.save_secret(ecp.session_file, cookie_header)
+            self.refresh_license()
+            return {"key_info": key_info, "license_warning": ""}
+
+        try:
+            return await capture_portal_session(
+                login_url=PORTAL_LOGIN_URL,
+                cabinet_host=cabinet_host,
+                validate=validate,
+                profile_dir=Path(ecp.browser_profile_dir),
+                browser=find_browser(ecp.browser_path),
+                timeout=ecp.browser_login_timeout,
+            )
+        except BrowserLoginError as exc:
+            raise PortalError(str(exc), code=exc.code) from exc
+
     async def start_session(self) -> None:
         await self.session.start()
         self._apply_director_mode()
@@ -280,7 +316,14 @@ class Backend:
         try:
             await self.session.apply_manual_token(saved)
             self.log.info("Сессия портала восстановлена из защищённого хранилища")
-        except Exception as exc:
+        except PortalError as exc:
+            self.session.mark_auth_failed()
+            if exc.code != "TOKEN_REJECTED":
+                # Нет сети / портал недоступен: сессия может быть жива — не стираем.
+                self.log.warning(
+                    "Сохранённую сессию портала проверить не удалось: %s", exc
+                )
+                return
             ecp_store.delete_secret(self.settings.ecp.session_file)
             self.log.warning(
                 "Сохранённая сессия портала недействительна (%s) — файл очищен", exc
@@ -1761,13 +1804,16 @@ class FastBidApp(ctk.CTk):
             self._unlock_button.configure(state="disabled", text="Вход…")
             future = self.bridge.submit(self.backend.apply_token(value))
         elif not self.settings.cabinet_api_verified:
-            # ЭЦП-вход в LIVE не реализован (SSO zakup.gov.kz — закрытый SPA).
-            if messagebox.askyesno(
-                "Вход по ЭЦП недоступен",
-                f"{LIVE_AUTH_NOTICE}\n\nОткрыть портал в браузере?",
-            ):
-                self._on_open_portal()
-            return
+            # LIVE: SSO zakup.gov.kz работает только в браузере. Вход по ЭЦП
+            # идёт в окне браузера, Cookie кабинета FastBid забирает сам.
+            self._unlock_button.configure(state="disabled", text="Жду вход в браузере…")
+            # «Заблокировать» во время ожидания = отмена входа.
+            self._lock_button.configure(state="normal")
+            self.log.info(
+                "Войдите на портале по ЭЦП в открывшемся окне браузера — "
+                "FastBid подхватит сессию автоматически"
+            )
+            future = self.bridge.submit(self.backend.browser_login())
         else:
             # ЭЦП: пароль в GUI не спрашиваем — NCALayer показывает своё окно
             # выбора ключа и ввода пароля.
@@ -1808,6 +1854,8 @@ class FastBidApp(ctk.CTk):
             if self._closing or future is not self._login_future:
                 return
             self._auth_mode_menu.configure(state="normal")
+            # Во время входа через браузер «Заблокировать» служила отменой.
+            self._lock_button.configure(state="disabled")
             try:
                 data = future.result()
             except (PortalError, NCALayerError) as exc:
@@ -1833,6 +1881,11 @@ class FastBidApp(ctk.CTk):
                         "\n\nПодсказка: токен живёт недолго — копируйте его "
                         "непосредственно перед входом и убедитесь, что "
                         "браузер ещё залогинен в кабинет."
+                    )
+                elif getattr(exc, "code", "") == "BROWSER_NOT_FOUND":
+                    hint = (
+                        "\n\nМожно войти и без него: «Открыть портал в браузере», "
+                        "затем способ входа «Токен из браузера» и вставка Cookie."
                     )
                 elif (
                     getattr(exc, "code", "") in {"NO_CHALLENGE", "NO_TOKEN"}

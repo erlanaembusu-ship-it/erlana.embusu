@@ -1,0 +1,317 @@
+"""Вход по ЭЦП через браузер: сессия портала подхватывается автоматически.
+
+Официальный вход (SSO zakup.gov.kz + NCALayer) работает только в браузере, а
+обычный браузер не может передать приложению свои Cookie. Поэтому FastBid
+открывает Chromium-браузер (Edge/Chrome) с ОТДЕЛЬНЫМ профилем и включённым
+DevTools-протоколом только на 127.0.0.1. Пользователь входит по ЭЦП как
+обычно, а приложение читает Cookie кабинета через CDP (``Storage.getCookies``)
+и проверяет их запросом к странице кабинета.
+
+Профиль браузера отдельный: основной профиль пользователя не трогается (Chrome
+136+ и не разрешает DevTools для профиля по умолчанию).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from collections.abc import Awaitable, Callable, Iterable, Mapping
+from pathlib import Path
+from typing import Any, TypeVar
+from urllib.parse import urlsplit
+
+import httpx
+from websockets.asyncio.client import connect
+from websockets.exceptions import WebSocketException
+
+from utils.logger import get_logger
+
+__all__ = [
+    "BrowserLoginError",
+    "capture_portal_session",
+    "cookie_header_for_host",
+    "find_browser",
+]
+
+T = TypeVar("T")
+LOG = get_logger("browser_login")
+
+# Порт, выбранный самим браузером (--remote-debugging-port=0), Chromium пишет
+# в этот файл каталога профиля.
+_PORT_FILE = "DevToolsActivePort"
+
+
+class BrowserLoginError(RuntimeError):
+    """Вход через браузер невозможен или прерван."""
+
+    def __init__(self, message: str, code: str = "") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+# --------------------------------------------------------------------------- #
+# Поиск браузера
+# --------------------------------------------------------------------------- #
+def _windows_candidates() -> list[Path]:
+    roots = [
+        os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
+        os.environ.get("PROGRAMFILES", r"C:\Program Files"),
+        os.environ.get("LOCALAPPDATA", ""),
+    ]
+    tails = (
+        r"Microsoft\Edge\Application\msedge.exe",
+        r"Google\Chrome\Application\chrome.exe",
+        r"Yandex\YandexBrowser\Application\browser.exe",
+        r"Chromium\Application\chrome.exe",
+    )
+    return [Path(root) / tail for tail in tails for root in roots if root]
+
+
+def find_browser(override: str = "") -> str | None:
+    """Путь к Chromium-браузеру (Edge, Chrome, Яндекс, Chromium) или None."""
+    if override:
+        resolved = shutil.which(override) or (
+            override if Path(override).is_file() else None
+        )
+        if resolved:
+            return resolved
+        LOG.warning(
+            "FASTBID_BROWSER=%s не найден — ищу браузер автоматически", override
+        )
+    if sys.platform == "win32":
+        for path in _windows_candidates():
+            if path.is_file():
+                return str(path)
+        return None
+    if sys.platform == "darwin":
+        for app in (
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ):
+            if Path(app).is_file():
+                return app
+    for name in (
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+        "microsoft-edge",
+        "microsoft-edge-stable",
+    ):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Cookie
+# --------------------------------------------------------------------------- #
+def _domain_matches(host: str, domain: str) -> bool:
+    domain = domain.lstrip(".").lower()
+    host = host.lower()
+    return bool(domain) and (host == domain or host.endswith("." + domain))
+
+
+def cookie_header_for_host(cookies: Iterable[Mapping[str, Any]], host: str) -> str:
+    """Cookie-заголовок, который браузер отправил бы на ``host``."""
+    now = time.time()
+    pairs: dict[str, str] = {}
+    for cookie in cookies:
+        name = str(cookie.get("name") or "")
+        if not name or not _domain_matches(host, str(cookie.get("domain") or "")):
+            continue
+        expires = cookie.get("expires")
+        # session-cookie: expires == -1; истёкшие браузер ещё может отдавать.
+        if isinstance(expires, (int, float)) and 0 < expires < now:
+            continue
+        pairs[name] = str(cookie.get("value") or "")
+    return "; ".join(f"{name}={value}" for name, value in sorted(pairs.items()))
+
+
+def _is_auth_url(url: str) -> bool:
+    path = urlsplit(url).path.lower()
+    return "login" in path or "sso" in path
+
+
+def _cabinet_pages(targets: Iterable[Mapping[str, Any]], host: str) -> list[str]:
+    """Открытые вкладки кабинета, не являющиеся страницами входа."""
+    pages: list[str] = []
+    for target in targets:
+        url = str(target.get("url") or "")
+        if target.get("type") != "page" or not url.startswith("https://"):
+            continue
+        if (urlsplit(url).hostname or "").lower() == host.lower() and not _is_auth_url(
+            url
+        ):
+            pages.append(url)
+    return pages
+
+
+# --------------------------------------------------------------------------- #
+# DevTools
+# --------------------------------------------------------------------------- #
+class _Cdp:
+    """Минимальный CDP-клиент поверх браузерного websocket."""
+
+    def __init__(self, ws: Any) -> None:
+        self._ws = ws
+        self._next_id = 0
+
+    async def call(self, method: str, **params: Any) -> dict[str, Any]:
+        self._next_id += 1
+        msg_id = self._next_id
+        await self._ws.send(
+            json.dumps({"id": msg_id, "method": method, "params": params})
+        )
+        while True:
+            message = json.loads(await self._ws.recv())
+            if message.get("id") != msg_id:
+                continue  # события CDP нам не нужны
+            if "error" in message:
+                raise BrowserLoginError(
+                    f"DevTools {method}: {message['error'].get('message', message['error'])}",
+                    code="CDP_ERROR",
+                )
+            return message.get("result") or {}
+
+
+async def _devtools_version(port: int) -> dict[str, Any] | None:
+    # trust_env=False: системный прокси не должен перехватывать loopback.
+    try:
+        async with httpx.AsyncClient(trust_env=False, timeout=2.0) as client:
+            response = await client.get(f"http://127.0.0.1:{port}/json/version")
+        return response.json() if response.status_code == 200 else None
+    except (httpx.HTTPError, ValueError):
+        return None
+
+
+def _read_port(profile_dir: Path) -> int | None:
+    try:
+        first = (profile_dir / _PORT_FILE).read_text(encoding="utf-8").splitlines()[0]
+        port = int(first.strip())
+    except (OSError, IndexError, ValueError):
+        return None
+    return port if 0 < port < 65536 else None
+
+
+async def _attach_or_launch(
+    browser: str,
+    profile_dir: Path,
+    url: str,
+    launch_timeout: float,
+) -> tuple[str, bool]:
+    """Возвращает (webSocketDebuggerUrl, reused)."""
+    port = _read_port(profile_dir)
+    if port is not None:
+        info = await _devtools_version(port)
+        if info and info.get("webSocketDebuggerUrl"):
+            return str(info["webSocketDebuggerUrl"]), True
+        # Файл от прошлого (закрытого) запуска.
+        (profile_dir / _PORT_FILE).unlink(missing_ok=True)
+
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    args = [
+        browser,
+        "--remote-debugging-port=0",
+        f"--user-data-dir={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--new-window",
+        url,
+    ]
+    try:
+        subprocess.Popen(  # noqa: S603 - путь браузера, без shell
+            args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+    except OSError as exc:
+        raise BrowserLoginError(
+            f"Не удалось запустить браузер {browser}: {exc}", code="BROWSER_LAUNCH"
+        ) from exc
+
+    deadline = time.monotonic() + launch_timeout
+    while time.monotonic() < deadline:
+        port = _read_port(profile_dir)
+        if port is not None:
+            info = await _devtools_version(port)
+            if info and info.get("webSocketDebuggerUrl"):
+                return str(info["webSocketDebuggerUrl"]), False
+        await asyncio.sleep(0.25)
+    raise BrowserLoginError(
+        "Браузер запущен, но DevTools не ответил. Закройте окна этого браузера, "
+        "открытые FastBid, и повторите вход.",
+        code="BROWSER_NO_DEVTOOLS",
+    )
+
+
+async def capture_portal_session(
+    *,
+    login_url: str,
+    cabinet_host: str,
+    validate: Callable[[str, str], Awaitable[T | None]],
+    profile_dir: Path,
+    browser: str | None = None,
+    timeout: float = 600.0,
+    poll_interval: float = 1.5,
+    launch_timeout: float = 20.0,
+    on_browser_ready: Callable[[], None] | None = None,
+) -> T:
+    """Открывает вход в браузере и ждёт сессию кабинета.
+
+    ``validate(cookie_header, page_url)`` проверяет Cookie на портале:
+    возвращает результат при успехе и ``None``, если сессия ещё не готова
+    (пользователь не завершил вход). Вызывается только при изменении Cookie
+    или открытых страниц кабинета — портал не опрашивается впустую.
+    """
+    exe = browser or find_browser()
+    if not exe:
+        raise BrowserLoginError(
+            "Не найден браузер Edge/Chrome/Chromium для входа по ЭЦП. "
+            "Установите один из них или укажите путь в FASTBID_BROWSER.",
+            code="BROWSER_NOT_FOUND",
+        )
+    ws_url, reused = await _attach_or_launch(
+        exe, profile_dir, login_url, launch_timeout
+    )
+    LOG.info(
+        "Браузер для входа %s: войдите на портале по ЭЦП — FastBid подхватит сессию",
+        "уже открыт" if reused else "запущен",
+    )
+    deadline = time.monotonic() + timeout
+    last_signature: tuple[str, tuple[str, ...]] | None = None
+    try:
+        async with connect(ws_url, max_size=None, open_timeout=5) as ws:
+            cdp = _Cdp(ws)
+            if reused:
+                await cdp.call("Target.createTarget", url=login_url)
+            if on_browser_ready is not None:
+                on_browser_ready()
+            while time.monotonic() < deadline:
+                cookies = (await cdp.call("Storage.getCookies")).get("cookies") or []
+                targets = (await cdp.call("Target.getTargets")).get("targetInfos") or []
+                header = cookie_header_for_host(cookies, cabinet_host)
+                pages = _cabinet_pages(targets, cabinet_host)
+                signature = (header, tuple(pages))
+                if header and pages and signature != last_signature:
+                    last_signature = signature
+                    result = await validate(header, pages[0])
+                    if result is not None:
+                        return result
+                await asyncio.sleep(poll_interval)
+    except (OSError, WebSocketException) as exc:
+        raise BrowserLoginError(
+            "Окно браузера закрыто до завершения входа", code="BROWSER_CLOSED"
+        ) from exc
+    raise BrowserLoginError(
+        f"Вход на портале не завершён за {timeout / 60:.0f} мин", code="BROWSER_TIMEOUT"
+    )

@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from config.settings import WatcherSettings
+from config.settings import AppSettings
 from core.lot_watcher import LotState
 
 _LABEL_RE = r'([^<>"]{4,70}?)\s*</(?:th|td|label|span|b|strong)>'
@@ -22,9 +22,7 @@ _TEXT_RE = r">([^<>]{2,120})<"
 
 def _field_after(html: str, label: str) -> str:
     """Значение input'а, следующего за подписью поля (Yii-рендер)."""
-    match = re.search(
-        re.escape(label) + r"[\s\S]{0,400}?value=\"([^\"]*)\"", html
-    )
+    match = re.search(re.escape(label) + r"[\s\S]{0,400}?value=\"([^\"]*)\"", html)
     return match.group(1).strip() if match else ""
 
 
@@ -52,9 +50,7 @@ def parse_lots_tab(html: str) -> list[dict[str, Any]]:
     """Разбирает вкладку «Лоты»: строки таблицы с номерами лотов."""
     lots: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for match in re.finditer(
-        r"(\d{6,12}-[А-ЯA-Z0-9]{1,4})", html
-    ):
+    for match in re.finditer(r"(\d{6,12}-[А-ЯA-Z0-9]{1,4})", html):
         lot_number = match.group(1)
         if lot_number in seen:
             continue
@@ -80,7 +76,7 @@ def parse_lots_tab(html: str) -> list[dict[str, Any]]:
 def lot_state_from_announce(
     anno: dict[str, Any],
     lot: dict[str, Any],
-    settings: WatcherSettings,
+    settings: AppSettings,
 ) -> LotState:
     """Собирает LotState из разобранной страницы объявления."""
     from core.lot_watcher import parse_portal_datetime
@@ -110,7 +106,9 @@ def lot_state_from_announce(
         start_date=start.strftime("%Y-%m-%d %H:%M:%S")
         if start
         else anno.get("start_date") or "",
-        end_date=end.strftime("%Y-%m-%d %H:%M:%S") if end else anno.get("end_date") or "",
+        end_date=end.strftime("%Y-%m-%d %H:%M:%S")
+        if end
+        else anno.get("end_date") or "",
         kato=(),
         raw={
             "source": "v3bl_html",

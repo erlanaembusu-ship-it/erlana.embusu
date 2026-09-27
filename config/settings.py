@@ -42,9 +42,9 @@ OWS_TOKEN_NOTICE: Final[str] = (
     "v3bl.goszakup.gov.kz → Профиль участника → Токены."
 )
 LIVE_AUTH_NOTICE: Final[str] = (
-    "Вход в живой кабинет из FastBid пока недоступен: контракт SSO и проверка "
-    "кабинетной сессии не подтверждены. Используйте официальный вход в браузере "
-    "через zakup.gov.kz. Вход в браузере не авторизует FastBid автоматически."
+    "Прямой вход в живой кабинет из FastBid недоступен: контракт SSO не "
+    "подтверждён. Используйте «Войти по ЭЦП» (вход в окне браузера, сессия "
+    "подхватывается автоматически) или «Войти по токену» (вставка Cookie)."
 )
 LIVE_SUBMIT_NOTICE: Final[str] = (
     "LIVE-подача заблокирована: адреса и формат подачи кабинета не подтверждены. "
@@ -117,6 +117,8 @@ class PortalEndpoints:
 
     # Человекочитаемая карточка объявления (для логов/UI)
     lot_view_path: str = "/ru/announce/index/{trd_buy_id}?tab=lots"
+    # Страница кабинета только для вошедших: проверка импортированной сессии. VERIFY
+    cabinet_check_path: str = _env("FASTBID_CABINET_CHECK_PATH", "/ru/cabinet/profile")
 
     # --- Аутентификация по ЭЦП (VERIFY по трафику кабинета) ---
     auth_challenge_path: str = "/api/auth/challenge"  # VERIFY
@@ -453,6 +455,11 @@ class EcpSettings:
     password_file: Path = DATA_DIR / "ecp_secret.bin"
     # DPAPI-шифрованная сессия портала из браузера (Cookie — «Войти по токену»).
     session_file: Path = DATA_DIR / "session_secret.bin"
+    # «Войти по ЭЦП» в LIVE: отдельный профиль Edge/Chrome, из которого FastBid
+    # забирает Cookie кабинета после входа. Путь к браузеру — необязательно.
+    browser_profile_dir: Path = DATA_DIR / "browser_profile"
+    browser_path: str = _env("FASTBID_BROWSER", "")
+    browser_login_timeout: float = _env("FASTBID_BROWSER_LOGIN_TIMEOUT", 600.0)
 
 
 @dataclass(frozen=True, slots=True)

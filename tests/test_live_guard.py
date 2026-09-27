@@ -151,13 +151,92 @@ def test_live_session_never_calls_cabinet(live) -> None:
             assert info.value.code == "LIVE_AUTH_UNVERIFIED"
             with pytest.raises(PortalError):
                 await session.authenticate()
-            with pytest.raises(PortalError):
-                await session.apply_manual_token("Bearer abc")
         finally:
             await session.close()
 
     run(scenario())
     assert calls == []
+
+
+def test_live_token_import_checks_cabinet_page(live) -> None:
+    """Импорт сессии из браузера в LIVE: только GET страницы кабинета, без API."""
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, text="<html><title>Профиль участника</title></html>")
+
+    async def scenario() -> str:
+        session = _session_with_transport(live, handler)
+        try:
+            await session.apply_manual_token("ci_session=abc")
+            assert session.token_only
+            return session.state.value
+        finally:
+            await session.close()
+
+    assert run(scenario()) == "online"
+    assert [(r.method, r.url.path) for r in calls] == [
+        ("GET", live.endpoints.cabinet_check_path)
+    ]
+    assert calls[0].headers["cookie"] == "ci_session=abc"
+
+
+def test_live_token_import_rejects_login_page(live) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path != "/ru/user/login":
+            return httpx.Response(302, headers={"Location": "/ru/user/login"})
+        return httpx.Response(200, text="<h1>Авторизация</h1>")
+
+    async def scenario() -> SessionManager:
+        session = _session_with_transport(live, handler)
+        session._client.follow_redirects = True
+        try:
+            with pytest.raises(PortalError) as info:
+                await session.apply_manual_token(
+                    "ci_session=dead",
+                    check_url=f"{live.endpoints.cabinet_base}/ru/myapp",
+                )
+            assert info.value.code == "TOKEN_REJECTED"
+            return session
+        finally:
+            await session.close()
+
+    session = run(scenario())
+    assert not session.token_only and not session.client.cookies
+
+
+def test_live_restore_keeps_session_file_when_offline(live, tmp_path) -> None:
+    """Нет сети при старте ≠ мёртвая сессия: сохранённый файл не стирается."""
+    from core import ecp_store
+    from ui.app import Backend, UiEventQueue
+
+    session_file = tmp_path / "session_secret.bin"
+    ecp_store.save_secret(session_file, "ci_session=abc")
+    settings = replace(live, ecp=replace(live.ecp, session_file=session_file))
+    responses = {"mode": "offline"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if responses["mode"] == "offline":
+            raise httpx.ConnectError("offline", request=request)
+        return httpx.Response(200, text="<h1>Авторизация</h1>")
+
+    async def scenario() -> list[bool]:
+        backend = Backend(settings, UiEventQueue())
+        backend.session._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        )
+        try:
+            await backend._restore_portal_session()
+            kept = session_file.exists()
+            responses["mode"] = "login_page"
+            await backend._restore_portal_session()
+            return [kept, session_file.exists()]
+        finally:
+            await backend.session.close()
+            await backend.ncalayer.close()
+
+    assert run(scenario()) == [True, False]
 
 
 def test_live_401_does_not_trigger_relogin(live) -> None:
