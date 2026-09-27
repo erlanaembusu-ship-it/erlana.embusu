@@ -995,7 +995,10 @@ class SessionManager:
                 pass
 
             if not self.settings.cabinet_api_verified:
-                # LIVE без подтверждённого API кабинета: пинговать нечего.
+                # LIVE: API кабинета нет — сессию из браузера держим живой
+                # запросом страницы кабинета.
+                if self.token_only and self.is_online:
+                    await self._live_keepalive()
                 continue
 
             if self.age_seconds >= session_cfg.max_age_seconds:
@@ -1027,3 +1030,28 @@ class SessionManager:
                     await self.relogin("сбой keep-alive")
                 except Exception as relogin_exc:
                     self.log.error("Auto-relogin после сбоя ping: %s", relogin_exc)
+
+    async def _live_keepalive(self) -> None:
+        """Keep-alive импортированной сессии: GET страницы кабинета."""
+        try:
+            await self.check_cabinet_page(
+                timeout=min(self.settings.timeouts.read, 10.0)
+            )
+        except PortalError as exc:
+            if exc.code in ("LOGIN_PAGE", "NOT_LOGGED_IN"):
+                self.log.error(
+                    "Сессия портала истекла — войдите заново («Войти по ЭЦП»)"
+                )
+                self._set_state(SessionState.EXPIRED)
+                return
+            self._keepalive_failures += 1
+            self.stats.failures += 1
+            self.log.warning("keep-alive кабинета не удался: %s", exc)
+            if self._keepalive_failures >= self.settings.session.keepalive_max_failures:
+                self._set_state(SessionState.DEGRADED)
+            return
+        self.stats.last_ping_at = time.time()
+        self._keepalive_failures = 0
+        if self._state is SessionState.DEGRADED:
+            self._set_state(SessionState.ONLINE)
+        BUS.publish("session_ping", latency_ms=0.0, age_s=round(self.age_seconds, 1))

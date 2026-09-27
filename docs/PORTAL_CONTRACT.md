@@ -77,3 +77,8 @@ TumarCSP: `SYSAPI.SetAPIKey` (`apiKey` = `hsm_api_key` из inline-скрипт�
 * `NCALayerClient` работает с `kz.gov.pki.knca.basics`; портал подписывает
   через `NURSign` (`multitext`/`binary`).
 * Шифрование цены через TumarCSP в конвейере отсутствует.
+
+Реализовано по этому протоколу: `core/draft_submit.py` (подача черновика в T0,
+налоговые сведения, проверка капчи) и keep-alive сессии страницей кабинета.
+Старый конвейер (`core/bid_pipeline.py`, `/api/bid/...`) в LIVE по-прежнему
+заблокирован.

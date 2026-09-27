@@ -121,6 +121,15 @@ class PortalEndpoints:
     # (сверено по HAR, см. docs/PORTAL_CONTRACT.md).
     cabinet_check_path: str = _env("FASTBID_CABINET_CHECK_PATH", "/ru/cabinet/permits")
 
+    # --- Подача подготовленного черновика (сверено по HAR) ---
+    announce_page_path: str = "/ru/announce/index/{anno_id}"
+    app_preview_path: str = "/ru/application/preview/{anno_id}/{app_id}"
+    app_submit_path: str = "/ru/application/ajax_public_application/{anno_id}/{app_id}"
+    app_view_path: str = "/ru/myapp/actionShowApp/{app_id}"
+    tax_debts_path: str = "/ru/cabinet/tax_debts"
+    # Лёгкий статический ответ nginx с заголовком Date — для часов сервера.
+    clock_probe_path: str = "/manifest.json"
+
     # --- Аутентификация по ЭЦП (VERIFY по трафику кабинета) ---
     auth_challenge_path: str = "/api/auth/challenge"  # VERIFY
     auth_login_path: str = "/api/auth/login"  # VERIFY
@@ -365,6 +374,12 @@ class PipelineSettings:
     price_step: float = 0.01
     hash_algo: str = "sha256"
     retry_attachment_upload: bool = True
+    # Подача черновика: сколько секунд после T0 повторять «Подать», если
+    # портал ещё не открыл приём, и пауза между последовательными попытками.
+    draft_retry_window_s: float = 20.0
+    draft_retry_interval_s: float = 0.25
+    # За сколько секунд до T0 обновить csrf и прогреть соединение.
+    draft_prepare_lead_s: float = 45.0
 
 
 # --------------------------------------------------------------------------- #

@@ -43,9 +43,10 @@ from config.settings import (
 )
 from core.bid_pipeline import BidPipeline, BidRequest, BidResult
 from core.browser_login import BrowserLoginError, capture_portal_session, find_browser
+from core.draft_submit import DraftRef, DraftSubmitter, parse_draft_ref
 from core.license_guard import LicenseGuard, LicenseStatus
 from core import ecp_store
-from core.lot_watcher import LotState, LotWatcher
+from core.lot_watcher import LotState, LotWatcher, parse_portal_datetime
 from core.ncalayer_client import (
     NCALayerClient,
     NCALayerError,
@@ -210,6 +211,7 @@ class Backend:
         self._pipeline_totals = {"planned": 0, "warmed": 0, "submitted": 0, "failed": 0}
         self._license_status: LicenseStatus | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._draft_future: concurrent.futures.Future[Any] | None = None
         # Способ входа: token (мост из браузера) | ecp (NCALayer).
         # LIVE → token по умолчанию, mock → ecp.
         self.auth_mode: str = "ecp" if settings.mode == "mock" else settings.auth_mode
@@ -475,6 +477,7 @@ class Backend:
         await self.ncalayer.close()
 
     async def lock_session(self) -> None:
+        self.disarm_draft()
         for lot_id in self.armed_ids():
             self.disarm(lot_id)
         tasks = list(self._active_tasks)
@@ -526,6 +529,84 @@ class Backend:
         return {"key_info": key_info, "license_warning": warning}
 
     # -- взвод заявок ------------------------------------------------------- #
+    def arm_draft(
+        self,
+        ref_text: str,
+        *,
+        real: bool,
+        t0_text: str = "",
+        request_tax: bool = True,
+    ) -> DraftRef:
+        """Взвод подачи черновика, подготовленного в браузере (см. core.draft_submit)."""
+        if self._loop is None:
+            raise RuntimeError("Backend не привязан к event loop")
+        if self._draft_future is not None and not self._draft_future.done():
+            raise ValueError("Подача черновика уже взведена — сначала снимите её")
+        if not self.session.is_online:
+            raise ValueError("Сначала войдите на портал («Войти по ЭЦП»)")
+        ref = parse_draft_ref(ref_text)
+        t0_epoch: float | None = None
+        if t0_text.strip():
+            parsed = parse_portal_datetime(t0_text, self.settings.watcher.portal_tz)
+            if parsed is None:
+                raise ValueError("T0: формат ГГГГ-ММ-ДД ЧЧ:ММ:СС")
+            t0_epoch = parsed.timestamp()
+        submitter = DraftSubmitter(self.session, self.settings)
+        self._draft_future = asyncio.run_coroutine_threadsafe(
+            self._run_draft(submitter, ref, not real, t0_epoch, request_tax),
+            self._loop,
+        )
+        return ref
+
+    def disarm_draft(self) -> None:
+        if self._draft_future is not None and not self._draft_future.done():
+            self._draft_future.cancel()
+
+    async def _run_draft(
+        self,
+        submitter: DraftSubmitter,
+        ref: DraftRef,
+        dry_run: bool,
+        t0_epoch: float | None,
+        request_tax: bool,
+    ) -> None:
+        def on_stage(name: str, info: dict[str, Any]) -> None:
+            self.events.put(
+                "draft",
+                ref=str(ref),
+                stage=name,
+                offset_s=submitter.clock.offset_s,
+                **info,
+            )
+
+        try:
+            result = await submitter.run(
+                ref,
+                dry_run=dry_run,
+                t0_epoch=t0_epoch,
+                request_tax=request_tax,
+                on_stage=on_stage,
+            )
+        except asyncio.CancelledError:
+            self.log.info("Подача черновика %s снята", ref)
+            self.events.put("draft_done", ref=str(ref), ok=False, message="Снято")
+            raise
+        except Exception as exc:
+            self.log.error("Подача черновика %s: %s", ref, exc)
+            self.events.put("draft_done", ref=str(ref), ok=False, message=str(exc))
+            return
+        finally:
+            self.session.set_t0(None)
+        self.events.put(
+            "draft_done",
+            ref=str(ref),
+            ok=result.ok,
+            dry_run=result.dry_run,
+            message=result.message,
+            attempts=result.attempts,
+            t0_delta_ms=result.t0_delta_ms,
+        )
+
     def arm(self, lot_id: int, blueprint_id: str, request: BidRequest) -> ArmedBid:
         with self._armed_lock:
             if lot_id in self.armed:
@@ -960,6 +1041,8 @@ class FastBidApp(ctk.CTk):
         for index in range(4):
             pills.grid_columnconfigure(index, weight=1, uniform="metrics")
 
+        self._build_draft_panel(tab)
+
         ctk.CTkLabel(
             tab,
             text="Взведённые заявки",
@@ -986,6 +1069,145 @@ class FastBidApp(ctk.CTk):
             wraplength=1100,
             justify="left",
         ).pack(anchor="w", padx=10, pady=4)
+
+    def _build_draft_panel(self, tab: Any) -> None:
+        """Подача черновика: заявка готовится в браузере, «Подать» — в T0."""
+        self._draft_t0: float | None = None
+        self._draft_offset = 0.0
+        box = ctk.CTkFrame(
+            tab,
+            fg_color=COLORS["card"],
+            corner_radius=10,
+            border_width=1,
+            border_color=COLORS["border"],
+        )
+        box.pack(fill="x", padx=8, pady=(10, 0))
+        ctk.CTkLabel(
+            box,
+            text="Подача подготовленной заявки",
+            font=ctk.CTkFont(size=13, weight="bold"),
+        ).pack(anchor="w", padx=10, pady=(8, 0))
+        ctk.CTkLabel(
+            box,
+            text="Заполните заявку в браузере до «Предварительного просмотра» "
+            "(документы, подписи, цены) и вставьте адрес этой страницы. "
+            "FastBid нажмёт «Подать» в момент открытия приёма по часам сервера.",
+            font=ctk.CTkFont(size=11),
+            text_color=COLORS["dim"],
+            wraplength=1100,
+            justify="left",
+        ).pack(anchor="w", padx=10)
+        row = ctk.CTkFrame(box, fg_color="transparent")
+        row.pack(fill="x", padx=10, pady=(6, 0))
+        self._draft_ref_entry = ctk.CTkEntry(
+            row,
+            width=460,
+            placeholder_text="…/ru/application/preview/<объявление>/<заявка>",
+        )
+        self._draft_ref_entry.pack(side="left")
+        self._draft_t0_entry = ctk.CTkEntry(
+            row, width=230, placeholder_text="T0: 2026-10-01 10:00:00"
+        )
+        self._draft_t0_entry.pack(side="left", padx=(8, 0))
+        self._draft_arm_button = ctk.CTkButton(
+            row,
+            text="Взвести подачу",
+            width=150,
+            command=self._on_arm_draft,
+            fg_color=COLORS["accent"],
+        )
+        self._draft_arm_button.pack(side="left", padx=(8, 0))
+        self._draft_disarm_button = ctk.CTkButton(
+            row,
+            text="Снять",
+            width=90,
+            state="disabled",
+            command=self._on_disarm_draft,
+            fg_color=COLORS["dim"],
+        )
+        self._draft_disarm_button.pack(side="left", padx=(8, 0))
+        opts = ctk.CTkFrame(box, fg_color="transparent")
+        opts.pack(fill="x", padx=10, pady=(6, 4))
+        self._draft_real_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(
+            opts, text="Реальная подача (иначе DRY-RUN)", variable=self._draft_real_var
+        ).pack(side="left")
+        self._draft_tax_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            opts,
+            text="Запросить налоговые сведения при взводе",
+            variable=self._draft_tax_var,
+        ).pack(side="left", padx=(16, 0))
+        self._draft_status = ctk.CTkLabel(
+            box,
+            text="Не взведено",
+            text_color=COLORS["dim"],
+            wraplength=1100,
+            justify="left",
+        )
+        self._draft_status.pack(anchor="w", padx=10, pady=(0, 8))
+
+    def _on_arm_draft(self) -> None:
+        real = bool(self._draft_real_var.get())
+        if real and not messagebox.askyesno(
+            "Подтверждение подачи",
+            "В момент открытия приёма FastBid нажмёт «Подать» за вас — заявка "
+            "будет подана на портале.\n\nПроверьте на предпросмотре документы и "
+            "цены. Продолжить?",
+        ):
+            return
+        try:
+            ref = self.backend.arm_draft(
+                self._draft_ref_entry.get(),
+                real=real,
+                t0_text=self._draft_t0_entry.get(),
+                request_tax=bool(self._draft_tax_var.get()),
+            )
+        except (ValueError, RuntimeError) as exc:
+            messagebox.showwarning("Подача черновика", str(exc))
+            return
+        self._draft_arm_button.configure(state="disabled")
+        self._draft_disarm_button.configure(state="normal")
+        self._draft_status.configure(
+            text=f"Заявка {ref}: подготовка…", text_color=COLORS["text"]
+        )
+
+    def _on_disarm_draft(self) -> None:
+        self.backend.disarm_draft()
+
+    def _on_draft_event(self, event: str, payload: dict[str, Any]) -> None:
+        ref = payload.get("ref", "")
+        if event == "draft":
+            self._draft_offset = float(payload.get("offset_s") or 0.0)
+            stage = payload.get("stage")
+            if stage == "armed":
+                self._draft_t0 = float(payload.get("t0_epoch") or 0.0) or None
+            elif stage == "tax":
+                self._draft_status.configure(
+                    text=f"Заявка {ref}: запрос налоговых сведений…"
+                )
+            elif stage == "fire":
+                self._draft_t0 = None
+                self._draft_status.configure(text=f"Заявка {ref}: подача…")
+            return
+        self._draft_t0 = None
+        self._draft_arm_button.configure(state="normal")
+        self._draft_disarm_button.configure(state="disabled")
+        message = str(payload.get("message") or "")
+        if payload.get("ok"):
+            delta = payload.get("t0_delta_ms")
+            tail = f" (T0 {delta:+.0f} мс)" if isinstance(delta, (int, float)) else ""
+            self._draft_status.configure(
+                text=f"Заявка {ref}: {message}{tail}", text_color=COLORS["ok"]
+            )
+            if not payload.get("dry_run"):
+                messagebox.showinfo("FastBid", f"Заявка {ref} подана.{tail}")
+        else:
+            self._draft_status.configure(
+                text=f"Заявка {ref}: {message[:140]}", text_color="#e0574b"
+            )
+            if message != "Снято":
+                messagebox.showerror("FastBid", f"Заявка {ref} не подана:\n{message}")
 
     # -- вкладка «Лоты» ------------------------------------------------------ #
     def _build_lots(self, tab: Any) -> None:
@@ -1951,6 +2173,12 @@ class FastBidApp(ctk.CTk):
                 left = self._left.get(lot_id)
                 if left is not None and self.backend.is_armed(lot_id):
                     card.countdown.set(left - elapsed)
+            if self._draft_t0 is not None:
+                left = max(0.0, self._draft_t0 - (time.time() + self._draft_offset))
+                hours, rest = divmod(int(left), 3600)
+                self._draft_status.configure(
+                    text=f"Взведено: до T0 {hours:02d}:{rest // 60:02d}:{rest % 60:02d}"
+                )
             for record in self.sink.drain():
                 self._log_console.append_record(record.format(), record.level)
             for event, payload in self.events.drain():
@@ -2096,6 +2324,8 @@ class FastBidApp(ctk.CTk):
                 card.set_status("Взведена — ожидание T0")
         elif event == "armed_done":
             self._on_armed_done(payload)
+        elif event in ("draft", "draft_done"):
+            self._on_draft_event(event, payload)
 
     def _on_armed_done(self, payload: dict[str, Any]) -> None:
         lot_id = int(payload.get("lot_id", 0))
