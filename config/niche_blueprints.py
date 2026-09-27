@@ -171,9 +171,7 @@ class PricingRule:
         raw_lower = lot_amount * self.min_factor
         if price > raw_upper:
             price = float(
-                (Decimal(str(raw_upper)) / step).to_integral_value(
-                    rounding=ROUND_DOWN
-                )
+                (Decimal(str(raw_upper)) / step).to_integral_value(rounding=ROUND_DOWN)
                 * step
             )
         elif price < raw_lower:

@@ -68,9 +68,7 @@ def _dpapi_unprotect(blob: bytes) -> bytes | None:
         ctypes.windll.kernel32.LocalFree(out.pbData)
 
 
-def save_profile(
-    path: Path, alias: str, password: str, key_path: str = ""
-) -> Path:
+def save_profile(path: Path, alias: str, password: str, key_path: str = "") -> Path:
     """Шифрует и сохраняет профиль ЭЦП (алиас/путь ключа + пароль)."""
     import json
 

@@ -353,9 +353,7 @@ class Backend:
             blueprint_id=blueprint.id,
             documents=documents,
             document_slots=slots,
-            dry_run=(
-                bool(dry_run) if dry_run is not None else self.settings.dry_run
-            ),
+            dry_run=(bool(dry_run) if dry_run is not None else self.settings.dry_run),
         )
 
     async def autopilot(self, ref: int, dry_run: bool | None = None) -> dict[str, Any]:
@@ -375,8 +373,7 @@ class Backend:
         missing = [
             d.label
             for d in blueprint.required_documents
-            if d.key not in request.document_slots
-            and d.kind is not DocKind.GENERATED
+            if d.key not in request.document_slots and d.kind is not DocKind.GENERATED
         ]
         report = {
             "lot_id": state.lot_id,
@@ -400,15 +397,11 @@ class Backend:
             ", ".join(matched) or "не подобраны",
         )
         if missing:
-            self.log.warning(
-                "Нет обязательных документов: %s", ", ".join(missing)
-            )
+            self.log.warning("Нет обязательных документов: %s", ", ".join(missing))
         if not request.dry_run:
             self.log.info(
                 "Источники документов для реальной подачи: %s",
-                "; ".join(
-                    f"{name} — {source}" for name, source in self.DOC_SOURCES
-                ),
+                "; ".join(f"{name} — {source}" for name, source in self.DOC_SOURCES),
             )
         return report
 
@@ -1297,9 +1290,9 @@ class FastBidApp(ctk.CTk):
         ).pack(side="left", padx=(8, 0))
         key_row = ctk.CTkFrame(frame, fg_color="transparent")
         key_row.pack(fill="x", pady=(4, 0))
-        ctk.CTkLabel(
-            key_row, text="Файл ключа ЭЦП:", font=ctk.CTkFont(size=11)
-        ).pack(side="left")
+        ctk.CTkLabel(key_row, text="Файл ключа ЭЦП:", font=ctk.CTkFont(size=11)).pack(
+            side="left"
+        )
         self._ecp_key_path_var = ctk.StringVar()
         ctk.CTkEntry(
             key_row,
@@ -1407,7 +1400,8 @@ class FastBidApp(ctk.CTk):
         key_path = self._ecp_key_path_var.get().strip()
         if not password:
             messagebox.showwarning(
-                "ЭЦП директора", "Введите пароль ЭЦП — без него автоподпись не работает."
+                "ЭЦП директора",
+                "Введите пароль ЭЦП — без него автоподпись не работает.",
             )
             return
         try:
