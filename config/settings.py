@@ -35,10 +35,11 @@ PORTAL_LOGIN_URL: Final[str] = "https://v3bl.goszakup.gov.kz/ru/user/sso_redirec
 # TLS NCALayer допускаются ТОЛЬКО для них.
 LOOPBACK_HOSTS: Final[frozenset[str]] = frozenset({"127.0.0.1", "::1", "localhost"})
 OWS_TOKEN_NOTICE: Final[str] = (
-    "Публичный реестр OWS v3 (ows.goszakup.gov.kz) отвечает HTTP 401 без токена. "
-    "Получите токен OWS в личном кабинете (раздел API / «Токен для OWS») и "
-    "задайте его в «Настройки» или через FASTBID_OWS_TOKEN. Токен хранится "
-    "только в памяти и отправляется только на хост реестра."
+    "Реестр OWS v3 (ows.goszakup.gov.kz) доступен только организациям, "
+    "которым выдан доступ к унифицированным сервисам. Доступ выпускается по "
+    "запросу организации в АО «Центр электронных финансов» (support@ecc.kz, "
+    "8 7172 73 55 15); после выпуска токен появляется в кабинете: "
+    "v3bl.goszakup.gov.kz → Профиль участника → Токены."
 )
 LIVE_AUTH_NOTICE: Final[str] = (
     "Вход в живой кабинет из FastBid пока недоступен: контракт SSO и проверка "
@@ -450,8 +451,6 @@ class EcpSettings:
     key_alias: str = _env("FASTBID_ECP_KEY_ALIAS", "")
     # DPAPI-шифрованный пароль (заполняется из GUI «Настройки»).
     password_file: Path = DATA_DIR / "ecp_secret.bin"
-    # DPAPI-шифрованный токен реестра OWS (заполняется из GUI «Применить»).
-    ows_token_file: Path = DATA_DIR / "ows_token.bin"
 
 
 @dataclass(frozen=True, slots=True)
@@ -474,8 +473,6 @@ class AppSettings:
     dry_run: bool = False
     # Режим работы: live (реальный портал) | mock (локальные заглушки)
     mode: str = "live"
-    # Bearer-токен публичного реестра OWS v3 (только RAM/env, в файлы не пишется).
-    ows_token: str = _env("FASTBID_OWS_TOKEN", "")
 
     @property
     def uses_local_mock(self) -> bool:
@@ -552,8 +549,6 @@ class AppSettings:
             ncalayer=ncalayer,
             mode="mock",
             auth_mode="ecp",
-            # Настоящий токен реестра не должен уходить на заглушки.
-            ows_token="",
         )
 
     def describe(self) -> dict[str, Any]:
@@ -570,7 +565,6 @@ class AppSettings:
             "dry_run": self.dry_run,
             "cabinet_api_verified": self.cabinet_api_verified,
             "live_submit_allowed": self.live_submit_allowed,
-            "ows_token": "задан" if self.ows_token else "нет",
             "data_dir": str(DATA_DIR),
         }
 

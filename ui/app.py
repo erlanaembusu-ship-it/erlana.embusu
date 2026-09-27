@@ -264,15 +264,6 @@ class Backend:
     async def start_session(self) -> None:
         await self.session.start()
         self._apply_director_mode()
-        self._restore_ows_token()
-
-    def _restore_ows_token(self) -> None:
-        """Восстанавливает токен OWS из DPAPI-файла (переживает перезапуск)."""
-        token = ecp_store.load_secret(self.settings.ecp.ows_token_file)
-        if not token:
-            return
-        self._apply_settings(self.settings.with_(ows_token=token))
-        self.log.info("Токен OWS восстановлен из защищённого хранилища")
 
     def _apply_director_mode(self) -> None:
         """Режим директора: профиль ЭЦП из DPAPI → авто-ключ и пароль сессии."""
@@ -447,21 +438,6 @@ class Backend:
         self.session.settings = updated
         self.pipeline.settings = updated
         self.watcher.settings = updated
-        return updated
-
-    async def set_ows_token(self, raw: str) -> AppSettings:
-        """Токен реестра OWS v3. Пустая строка — сброс (и файла тоже)."""
-        with self._armed_lock:
-            if self.armed:
-                raise ValueError("Снимите активные заявки перед сменой токена OWS")
-            token, _cookie = SessionManager.parse_credential(raw)
-            updated = self._apply_settings(self.settings.with_(ows_token=token))
-        if token:
-            ecp_store.save_secret(self.settings.ecp.ows_token_file, token)
-            self.log.info("Токен OWS сохранён в защищённое хранилище")
-        else:
-            ecp_store.delete_secret(self.settings.ecp.ows_token_file)
-            self.log.info("Токен OWS сброшен (файл удалён)")
         return updated
 
     async def unlock_and_login(self, password_value: str = "") -> dict[str, Any]:
@@ -1253,30 +1229,24 @@ class FastBidApp(ctk.CTk):
 
         ctk.CTkLabel(
             frame,
-            text="Токен реестра OWS v3",
+            text="DRY-RUN применяется при сохранении пакета на вкладке «Лоты».\n"
+            "Он проверяет план без подписи, загрузки документов и подачи.",
+            text_color=COLORS["dim"],
+            justify="left",
+        ).pack(anchor="w", pady=8)
+
+        ctk.CTkLabel(
+            frame,
+            text="Доступ к реестру OWS (для чтения реальных лотов)",
             font=ctk.CTkFont(size=13, weight="bold"),
         ).pack(anchor="w", pady=(10, 0))
-        ows_row = ctk.CTkFrame(frame, fg_color="transparent")
-        ows_row.pack(fill="x", pady=2)
-        self._ows_token_var = ctk.StringVar(value="")
-        ctk.CTkEntry(
-            ows_row,
-            textvariable=self._ows_token_var,
-            width=420,
-            show="•",
-            placeholder_text="Bearer-токен из кабинета (раздел API)",
-        ).pack(side="left")
-        ctk.CTkButton(
-            ows_row, text="Применить", width=120, command=self._on_apply_ows_token
-        ).pack(side="left", padx=(10, 0))
-        self._ows_token_label = ctk.CTkLabel(
+        ctk.CTkLabel(
             frame,
-            text=self._ows_token_status(),
+            text=OWS_TOKEN_NOTICE,
             text_color=COLORS["dim"],
             justify="left",
             wraplength=900,
-        )
-        self._ows_token_label.pack(anchor="w", pady=(2, 0))
+        ).pack(anchor="w", pady=(2, 0))
 
         # -- ЭЦП директора (автоподпись) ------------------------------------- #
         ctk.CTkLabel(
@@ -1375,30 +1345,6 @@ class FastBidApp(ctk.CTk):
             self._doc_dir_label.configure(text=chosen)
 
     # -- токен OWS и портал ------------------------------------------------- #
-    def _ows_token_status(self) -> str:
-        if self.settings.uses_local_mock:
-            return "MOCK: реестр — локальная заглушка, токен не нужен."
-        if self.settings.ows_token:
-            return "Токен OWS задан (хранится только в памяти)."
-        return f"Токен OWS не задан. {OWS_TOKEN_NOTICE}"
-
-    def _on_apply_ows_token(self) -> None:
-        value = self._ows_token_var.get().strip()
-        future = self.bridge.submit(self.backend.set_ows_token(value))
-
-        def applied() -> None:
-            try:
-                self.settings = future.result()
-            except Exception as exc:
-                # Не оставляем токен в поле и после ошибки применения.
-                self._ows_token_var.set("")
-                messagebox.showwarning("Токен OWS", str(exc))
-                return
-            self._ows_token_var.set("")
-            self._ows_token_label.configure(text=self._ows_token_status())
-
-        future.add_done_callback(lambda _f: self._callbacks.put(applied))
-
     # -- ЭЦП директора (автоподпись) ----------------------------------------- #
     def _ecp_status_text(self) -> str:
         alias, _password = ecp_store.load_profile(self.settings.ecp.password_file)

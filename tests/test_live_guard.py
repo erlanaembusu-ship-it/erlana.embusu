@@ -45,7 +45,7 @@ def run(coro: Any) -> Any:
 @pytest.fixture()
 def live():
     """LIVE-настройки по умолчанию (реальные адреса, без DRY-RUN)."""
-    return load_settings(dry_run=False, ows_token="")
+    return load_settings(dry_run=False)
 
 
 @pytest.fixture()
@@ -66,21 +66,6 @@ def test_flags_live_vs_mock(live, mock) -> None:
     assert fake.live_submit_allowed is False
 
 
-def test_redirect_to_mock_drops_real_ows_token() -> None:
-    settings = load_settings(ows_token="real-secret")
-    assert settings.ows_token == "real-secret"
-    assert settings.redirect_to_mock().ows_token == ""
-
-
-def test_describe_hides_ows_token() -> None:
-    described = load_settings(ows_token="real-secret").describe()
-    assert "real-secret" not in str(described)
-    assert described["live_submit_allowed"] is False
-
-
-# --------------------------------------------------------------------------- #
-# Конвейер: LIVE без DRY-RUN ничего не подписывает и не отправляет
-# --------------------------------------------------------------------------- #
 def _pipeline(settings: Any) -> BidPipeline:
     return BidPipeline(
         _ExplodingSession(), _NoSignNCA(), LotWatcher(None, settings), settings
@@ -195,36 +180,6 @@ def test_live_401_does_not_trigger_relogin(live) -> None:
 # --------------------------------------------------------------------------- #
 # Токен OWS
 # --------------------------------------------------------------------------- #
-def test_ows_token_sent_and_401_is_explained(live) -> None:
-    seen: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen.append(request.headers.get("authorization", ""))
-        return httpx.Response(401, text="Unauthorized")
-
-    async def scenario(settings: Any) -> PortalError:
-        session = _session_with_transport(settings, handler)
-        watcher = LotWatcher(session, settings)
-        try:
-            with pytest.raises(PortalError) as info:
-                await watcher.fetch(1, conditional=False)
-            with pytest.raises(PortalError) as info2:
-                await session.graphql("{ __typename }")
-            assert info2.value.code == "OWS_UNAUTHORIZED"
-            return info.value
-        finally:
-            await session.close()
-
-    error = run(scenario(live))
-    assert error.code == "OWS_UNAUTHORIZED"
-    assert "FASTBID_OWS_TOKEN" in str(error)
-    assert seen == ["", ""]
-
-    seen.clear()
-    run(scenario(live.with_(ows_token="tok123")))
-    assert seen == ["Bearer tok123", "Bearer tok123"]
-
-
 def test_live_clock_sync_uses_ows_not_cabinet(live) -> None:
     hosts: list[str] = []
 

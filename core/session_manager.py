@@ -288,11 +288,11 @@ class SessionManager:
     def ows_headers(self) -> dict[str, str]:
         """Заголовки для запросов к реестру OWS.
 
-        Токен OWS отправляется ТОЛЬКО на хост реестра и перекрывает возможный
-        кабинетный ``Authorization`` клиента (это разные учётные данные).
+        Токен не используется по решению владельца проекта: доступ к
+        унифицированным сервисам организации не оформлялся. Без доступа
+        реестр отвечает 401 — ошибка объясняется через ``ows_unauthorized``.
         """
-        token = self.settings.ows_token
-        return {"Authorization": f"Bearer {token}"} if token else {}
+        return {}
 
     @staticmethod
     def ows_unauthorized(status: int) -> PortalError:
