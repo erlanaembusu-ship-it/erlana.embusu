@@ -258,12 +258,33 @@ class Backend:
     async def apply_token(self, raw_credential: str) -> dict[str, Any]:
         """Одинаковый контракт результата для token и ЭЦП."""
         key_info = await self.session.apply_manual_token(raw_credential)
+        # Сессия портала сохраняется DPAPI-шифрованной: переживает перезапуск.
+        ecp_store.save_secret(self.settings.ecp.session_file, raw_credential)
         self.refresh_license()
         return {"key_info": key_info, "license_warning": ""}
 
     async def start_session(self) -> None:
         await self.session.start()
         self._apply_director_mode()
+        await self._restore_portal_session()
+
+    async def _restore_portal_session(self) -> None:
+        """Восстанавливает сессию портала из DPAPI (если ещё жива).
+
+        Мёртвая сессия портала отвечает страницей входа — файл чистится,
+        пользователю предлагается вставить Cookie заново.
+        """
+        saved = ecp_store.load_secret(self.settings.ecp.session_file)
+        if not saved:
+            return
+        try:
+            await self.session.apply_manual_token(saved)
+            self.log.info("Сессия портала восстановлена из защищённого хранилища")
+        except Exception as exc:
+            ecp_store.delete_secret(self.settings.ecp.session_file)
+            self.log.warning(
+                "Сохранённая сессия портала недействительна (%s) — файл очищен", exc
+            )
 
     def _apply_director_mode(self) -> None:
         """Режим директора: профиль ЭЦП из DPAPI → авто-ключ и пароль сессии."""
@@ -420,6 +441,8 @@ class Backend:
             await asyncio.gather(*tasks, return_exceptions=True)
         self.session.set_password(None)
         self.session.clear_credentials()
+        # «Заблокировать» = осознанный выход: сохранённая сессия тоже стирается.
+        ecp_store.delete_secret(self.settings.ecp.session_file)
 
     async def update_profile(self, profile: Any) -> AppSettings:
         with self._armed_lock:

@@ -1273,3 +1273,55 @@ def test_backend_autopilot_arms_from_announcement(tmp_path, settings) -> None:
     assert report["docs_missing"] == []
     assert "cert" in " ".join(report["docs_matched"])
     assert report["dry_run"] is False  # mock: подача разрешена
+
+
+def test_portal_session_persists_and_restores(tmp_path, settings, monkeypatch) -> None:
+    """Сессия портала из браузера: вставка один раз → DPAPI → восстановление.
+
+    Валидация ping изолируется: unit-тест проверяет ЖИЗНЕННЫЙ ЦИКЛ файла
+    (сохранение → восстановление → очистка при блокировке).
+    """
+    import asyncio
+
+    from ui.app import Backend, UiEventQueue
+
+    session_file = tmp_path / "session_secret.bin"
+    isolated = replace(settings.ecp, session_file=session_file)
+
+    async def scenario() -> dict:
+        servers = MockServers(open_after_s=3600.0, nca_password=PASSWORD)
+        await servers.start()
+        backend = None
+        try:
+            mock = servers.settings_for(settings).with_(ecp=isolated)
+            backend = Backend(mock, UiEventQueue())
+
+            async def fake_ping(timeout=None, allow_relogin=True):
+                return 1.0
+
+            monkeypatch.setattr(backend.session, "ping", fake_ping)
+            await backend.start_session()  # восстановление: файла нет → пропуск
+            await backend.apply_token("SESSION=test-session-abc")
+            saved = load_secret_file(session_file)
+            await backend.start_session()  # повторный старт восстанавливает
+            restored = backend.session.token_only
+            await backend.lock_session()  # осознанный выход чистит и файл
+            return {
+                "saved": saved,
+                "restored_token_only": restored,
+                "file_exists": session_file.exists(),
+            }
+        finally:
+            if backend is not None:
+                await backend.ncalayer.close()
+            await servers.stop()
+
+    def load_secret_file(path):
+        from core import ecp_store
+
+        return ecp_store.load_secret(path)
+
+    report = asyncio.run(scenario())
+    assert report["saved"] == "SESSION=test-session-abc"
+    assert report["restored_token_only"] is True  # сессия восстановлена
+    assert report["file_exists"] is False  # lock стёр сохранённую сессию

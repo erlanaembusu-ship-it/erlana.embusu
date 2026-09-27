@@ -451,6 +451,8 @@ class EcpSettings:
     key_alias: str = _env("FASTBID_ECP_KEY_ALIAS", "")
     # DPAPI-шифрованный пароль (заполняется из GUI «Настройки»).
     password_file: Path = DATA_DIR / "ecp_secret.bin"
+    # DPAPI-шифрованная сессия портала из браузера (Cookie — «Войти по токену»).
+    session_file: Path = DATA_DIR / "session_secret.bin"
 
 
 @dataclass(frozen=True, slots=True)
