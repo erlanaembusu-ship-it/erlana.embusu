@@ -475,14 +475,19 @@ class LotWatcher:
     async def resolve_reference(self, ref: int) -> tuple[LotState, bool]:
         """Автопилот: ID — это лот или объявление? Возвращает (лот, признак).
 
-        1. Пробуем ID как номер лота в реестре.
+        1. Пробуем ID как номер лота в реестре OWS.
         2. Если лота нет — как номер объявления (TrdBuy): берём его лоты.
            Один лот → берём его; несколько → ошибка со списком номеров
            (выбрать лот — единственное, что не автоматизируется).
+        3. Без доступа к OWS (401) — парсим страницы кабинета в сессии
+           поставщика (нужен импорт Cookie: «Войти по токену»).
         """
         try:
             return await self.fetch(int(ref), conditional=False), False
         except PortalError as exc:
+            if getattr(exc, "status", 0) == 401:
+                # Доступа к OWS нет — страницы кабинета отдают те же данные.
+                return await self._resolve_via_cabinet_html(int(ref)), True
             if getattr(exc, "status", 0) != 404:
                 raise
         result = await self.session.graphql(
@@ -519,6 +524,52 @@ class LotWatcher:
                 status=404,
             )
         return state, True
+
+    async def _resolve_via_cabinet_html(self, ref: int) -> LotState:
+        """Читает объявление со страниц кабинета (HTML вместо OWS).
+
+        Нужна живая сессия портала (импорт Cookie из браузера). Без неё
+        портал отвечает страницей входа — поднимаем понятную ошибку.
+        """
+        from core import v3bl_reader
+
+        base = self.settings.endpoints.cabinet_base.rstrip("/")
+        page_url = f"{base}/ru/announce/index/{ref}"
+
+        async def get(url: str) -> tuple[str, str]:
+            response = await self.session.request(
+                "GET",
+                url,
+                allow_relogin=False,
+                timeout=self.settings.timeouts.read,
+            )
+            html = response.text
+            final_url = str(getattr(response, "url", url))
+            if "/user/login" in final_url or "Авторизация" in html[:2000]:
+                raise PortalError(
+                    "Сессия портала истекла — войдите на портал и импортируйте "
+                    "Cookie заново («Войти по токену»)",
+                    code="PORTAL_SESSION_EXPIRED",
+                )
+            return html, final_url
+
+        announce_html, _ = await get(page_url)
+        anno = v3bl_reader.parse_announce_page(announce_html)
+        lots_html, _ = await get(page_url + "?tab=lots")
+        lots = v3bl_reader.parse_lots_tab(lots_html)
+        if not lots:
+            raise PortalError(
+                f"Объявление {ref}: лоты на странице не найдены",
+                code="REF_NOT_FOUND",
+            )
+        if len(lots) > 1:
+            numbers = ", ".join(lot.get("lot_number") or "" for lot in lots)
+            raise PortalError(
+                f"Объявление {ref} содержит {len(lots)} лотов ({numbers}) — "
+                "укажите номер конкретного лота",
+                code="REF_AMBIGUOUS",
+            )
+        return v3bl_reader.lot_state_from_announce(anno, lots[0], self.settings)
 
     async def sync_clock(self, samples: int | None = None) -> ClockSync:
         """Оценка смещения часов сервера (вызывать при взводе заявки).
