@@ -500,6 +500,46 @@ class Backend:
             )
         return report
 
+    async def tender_checklist(self, anno_id: int, app_id: int) -> list[dict[str, Any]]:
+        """Требования тендера к поставщику со страницы заявки (шаг «Документы»).
+
+        У каждого тендера свой набор обязательных документов — шаблона нет.
+        Возвращает чек-лист (parse_requirements) и печатает его в журнал:
+        обязательное неготовое — в начало, с подсказкой источника документа.
+        """
+        from core import tender_requirements as tr
+
+        submitter = DraftSubmitter(self.session, self.settings)
+        html = await submitter._get_cabinet_html(
+            self.settings.endpoints.cabinet_url(
+                self.settings.endpoints.docs_page_path,
+                anno_id=anno_id,
+                app_id=app_id,
+            )
+        )
+        requirements = tr.parse_requirements(html)
+        if not requirements:
+            raise ValueError(
+                "Таблица требований не найдена — заявка недоступна или шаг "
+                "«Документация» ещё не создан"
+            )
+        self.log.info(
+            "Требования тендера (объявление %s, заявка %s):\n%s",
+            anno_id,
+            app_id,
+            tr.format_checklist(requirements),
+        )
+        return [
+            {
+                "name": r.name,
+                "required": r.required,
+                "done": r.done,
+                "doc_id": r.doc_id,
+                "source": r.source,
+            }
+            for r in requirements
+        ]
+
     async def stop_session(self) -> None:
         await self.lock_session()
         await self.session.close()
@@ -584,7 +624,7 @@ class Backend:
             t0_epoch = parsed.timestamp()
         submitter = DraftSubmitter(self.session, self.settings)
         self._draft_future = asyncio.run_coroutine_threadsafe(
-            self._run_draft(submitter, ref, not real, t0_epoch, request_tax),
+            self._run_draft(submitter, ref, not real, t0_epoch, request_tax, real),
             self._loop,
         )
         return ref
@@ -600,6 +640,7 @@ class Backend:
         dry_run: bool,
         t0_epoch: float | None,
         request_tax: bool,
+        real: bool = False,
     ) -> None:
         def on_stage(name: str, info: dict[str, Any]) -> None:
             self.events.put(
@@ -609,6 +650,36 @@ class Backend:
                 offset_s=submitter.clock.offset_s,
                 **info,
             )
+
+        # Требования этого тендера к поставщику — до взвода: у каждого
+        # тендера свой набор документов, универсального шаблона нет.
+        try:
+            checklist = await self.tender_checklist(ref.anno_id, ref.app_id)
+            not_ready = [c["name"] for c in checklist if c["required"] and not c["done"]]
+            if not_ready and not real:
+                self.log.warning(
+                    "Обязательное не готово (для реальной подачи доделайте "
+                    "в браузере): %s",
+                    "; ".join(not_ready),
+                )
+            elif not_ready and real:
+                self.events.put(
+                    "draft_done",
+                    ref=str(ref),
+                    ok=False,
+                    message=(
+                        "Обязательные документы не готовы: "
+                        + "; ".join(not_ready)
+                        + " — см. чек-лист в журнале"
+                    ),
+                )
+                return
+        except PortalError as exc:
+            if exc.code == "PORTAL_SESSION_EXPIRED":
+                raise
+            # Страница заявки недоступна (нет шага «Документация») —
+            # требования покажет prepare() на предпросмотре.
+            self.log.warning("Чек-лист требований недоступен: %s", exc)
 
         try:
             result = await submitter.run(
@@ -1157,6 +1228,13 @@ class FastBidApp(ctk.CTk):
             fg_color=COLORS["dim"],
         )
         self._draft_disarm_button.pack(side="left", padx=(8, 0))
+        self._draft_req_button = ctk.CTkButton(
+            row,
+            text="Требования…",
+            width=120,
+            command=self._on_tender_requirements,
+        )
+        self._draft_req_button.pack(side="left", padx=(8, 0))
         opts = ctk.CTkFrame(box, fg_color="transparent")
         opts.pack(fill="x", padx=10, pady=(6, 4))
         self._draft_real_var = ctk.BooleanVar(value=False)
@@ -1205,6 +1283,50 @@ class FastBidApp(ctk.CTk):
 
     def _on_disarm_draft(self) -> None:
         self.backend.disarm_draft()
+
+    def _on_tender_requirements(self) -> None:
+        """Чек-лист требований тендера из поля адреса заявки (до взвода)."""
+        try:
+            ref = parse_draft_ref(self._draft_ref_entry.get())
+        except ValueError as exc:
+            messagebox.showwarning("Требования", str(exc))
+            return
+        if not self.backend.session.is_online:
+            messagebox.showwarning("Требования", "Сначала войдите на портал.")
+            return
+        self._draft_req_button.configure(state="disabled", text="Читаю…")
+
+        def done(future: concurrent.futures.Future) -> None:
+            self._draft_req_button.configure(state="normal", text="Требования…")
+            try:
+                checklist = future.result()
+            except (PortalError, ValueError) as exc:
+                self.log.error("Требования: %s", exc)
+                messagebox.showerror("Требования", str(exc))
+                return
+            todo = [c for c in checklist if c["required"] and not c["done"]]
+            ready = [c for c in checklist if c["done"]]
+            rows = []
+            if todo:
+                rows.append("ОБЯЗАТЕЛЬНОЕ, НЕ ГОТОВО:")
+                rows += [f"  ✗ {c['name']} — {c['source']}" for c in todo]
+            opt = [c for c in checklist if not c["required"] and not c["done"]]
+            if opt:
+                rows.append("Необязательное:")
+                rows += [f"  · {c['name']} — {c['source']}" for c in opt]
+            if ready:
+                rows.append(
+                    f"Готово ({len(ready)}): "
+                    + "; ".join(c["name"].split(" (")[0] for c in ready)
+                )
+            messagebox.showinfo(
+                f"Требования тендера {ref.anno_id}/{ref.app_id}", "\n".join(rows)
+            )
+
+        future = self.bridge.submit(
+            self.backend.tender_checklist(ref.anno_id, ref.app_id)
+        )
+        future.add_done_callback(done)
 
     def _on_draft_event(self, event: str, payload: dict[str, Any]) -> None:
         ref = payload.get("ref", "")

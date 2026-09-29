@@ -135,6 +135,9 @@ class PortalEndpoints:
 
     # --- Подача подготовленного черновика (сверено по HAR) ---
     announce_page_path: str = "/ru/announce/index/{anno_id}"
+    # Шаг «Документация» заявки: таблица требований тендера к поставщику
+    # (обязательность + отметка выполненности) — снято с живой заявки.
+    docs_page_path: str = "/ru/application/docs/{anno_id}/{app_id}"
     app_preview_path: str = "/ru/application/preview/{anno_id}/{app_id}"
     app_submit_path: str = "/ru/application/ajax_public_application/{anno_id}/{app_id}"
     app_view_path: str = "/ru/myapp/actionShowApp/{app_id}"
